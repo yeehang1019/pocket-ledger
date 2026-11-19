@@ -1,0 +1,48 @@
+/* Shared Mono/Neon materials, compact financial hierarchy, no accounting changes. */
+:root[data-world] .trip-payables-card{padding:24px!important;container-type:inline-size}
+.trip-payables-head,.trip-payables-title,.trip-payables-overview,.trip-sync-buttons{display:flex;align-items:center;gap:12px}
+.trip-payables-head{justify-content:space-between;flex-wrap:wrap;gap:16px}
+.trip-payables-title{min-width:0}
+.trip-link-icon,.trip-group-icon{display:grid;place-items:center;width:44px;height:44px;flex:none;border-radius:14px;background:var(--app-tint);color:var(--app-text)}
+:root[data-world] .trip-payables-title h2{font-size:20px;line-height:1.3;margin:0;font-weight:650}
+.trip-payables-title p{font-size:13px;color:var(--app-muted);margin:4px 0 0;line-height:1.5}
+.trip-sync-badge{display:inline-flex;align-items:center;gap:7px;padding:7px 11px;border-radius:999px;background:var(--app-tint);color:var(--app-muted);font-size:12px;line-height:1.4;white-space:nowrap}
+.trip-sync-badge i{width:6px;height:6px;background:currentColor;border-radius:50%}
+.trip-sync-badge.is-error{color:var(--red)}
+.trip-payables-overview{justify-content:space-between;align-items:flex-end;margin:24px 0;gap:24px;flex-wrap:wrap}
+.trip-payables-amounts{display:flex;flex-direction:column;gap:8px;min-width:0}
+.trip-payables-amounts>strong{font-size:36px;line-height:1.15;letter-spacing:-.035em;font-weight:700;font-variant-numeric:tabular-nums;white-space:nowrap;color:var(--app-text)}
+.trip-payables-amounts>.trip-no-dues{font-size:24px}
+.trip-payables-meta{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--app-muted)}
+.trip-sync-controls{display:flex;flex-direction:column;align-items:flex-end;gap:10px}
+.trip-last-sync,.trip-loading{font-size:13px;color:var(--app-muted)}
+:root[data-world] .trip-sync-buttons button{display:flex;align-items:center;justify-content:center;gap:7px;min-height:44px;padding:0 14px!important;font-size:13px!important;white-space:nowrap;border-radius:999px!important;background:var(--app-tint)!important;color:var(--app-text)!important;box-shadow:none!important;border:0!important}
+.trip-sync-buttons button:disabled{opacity:.45;cursor:default}
+.trip-payable-group{border-top:1px solid var(--sep)}
+.trip-payable-group>summary{display:flex;align-items:center;gap:12px;list-style:none;min-height:80px;padding:14px 0;cursor:pointer;border-radius:14px}
+.trip-payable-group>summary::-webkit-details-marker{display:none}
+.trip-group-title{display:flex;flex-direction:column;gap:4px;min-width:0;flex:1}
+.trip-group-title strong{font-size:16px;font-weight:600;overflow-wrap:anywhere}
+.trip-group-title small{font-size:13px;color:var(--app-muted);overflow-wrap:anywhere}
+.trip-group-balance{display:flex;flex-direction:column;align-items:flex-end;gap:4px;font-size:17px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.trip-group-chevron{color:var(--app-muted);flex:none;transition:transform 180ms}
+.trip-payable-group[open] .trip-group-chevron{transform:rotate(180deg)}
+.trip-payable-entry{display:flex;align-items:center;gap:12px;margin:0 0 8px;padding:12px;border-radius:16px;background:var(--app-tint)}
+.trip-payable-entry>div:first-child{flex:1;min-width:0}
+.trip-payable-entry strong{font-size:15px;font-weight:600;overflow-wrap:anywhere}
+.trip-payable-entry p,.trip-entry-amount small{font-size:12px;color:var(--app-muted);margin:4px 0 0}
+.trip-entry-amount{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
+.trip-entry-amount b{font-size:16px}.trip-entry-amount small{display:block}
+.trip-payable-entry>a{display:grid;place-items:center;width:44px;height:44px;flex:none;border-radius:50%;color:var(--app-text);background:var(--app-surface)}
+.trip-payables-error{display:flex;align-items:center;justify-content:space-between;gap:12px;color:var(--red);font-size:13px;padding:12px 0}
+.trip-payables-error button{min-height:44px;flex:none}
+.due-action-buttons{display:flex;align-items:center;gap:8px}
+:root[data-world] .due-action-buttons>button{min-height:44px!important;min-width:44px!important;padding:0 12px!important;font-size:13px!important;margin:0!important;white-space:nowrap;border-radius:999px!important;border:0!important;box-shadow:none!important;background:var(--app-tint)!important;color:var(--app-text)!important}
+:root[data-world] .due-action-buttons>.due-ignore{background:transparent!important;color:var(--app-muted)!important;padding-inline:8px!important}
+:root[data-world] .due-row[data-amount-pending=true] .due-action-buttons>.secondary{border:1px dashed var(--orange)!important;background:none!important;color:var(--app-text)!important}
+.due-action-buttons>button:disabled{opacity:.45;cursor:default}
+.ignored-terms>p{font-size:13px;color:var(--app-muted)}.ignored-terms .plan-row small{display:block;font-size:13px;margin-top:4px;color:var(--app-muted)}
+.ignored-link{min-height:44px;margin:12px 4px 0;font-size:13px}
+.disposition-term{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:16px;border-radius:16px;background:var(--app-tint)}.disposition-term span{font-size:13px;color:var(--app-muted)}
+@container(max-width:520px){.trip-payables-overview{gap:16px}.trip-sync-controls{align-items:flex-start;width:100%}.trip-sync-buttons{flex-wrap:wrap}.trip-payables-amounts>strong{font-size:32px}.trip-group-icon{display:none}.trip-group-balance{font-size:15px}}
+@media(max-width:1023px){:root[data-world] .trip-payables-card{padding:20px!important}.trip-payable-entry{flex-wrap:wrap}.due-action-buttons{gap:4px}:root[data-world] .due-action-buttons>button{padding:0 8px!important}}

@@ -1,0 +1,5 @@
+/** Persisted ledger rows. Monetary values are integer minor units, never display strings. */
+export type TransactionRow={id:string;owner:string;title:string;amount:number;currency:string;kind:string;category:string;date:string;note:string;deleted:number;rule_id:string;occurrence:string;created_at:string};
+export type RuleRow={id:string;owner:string;title:string;amount:number;currency:string;kind:string;category:string;start:string;frequency:string;month_days:string;revision:number;mode:string;status:string;processed_through:string;created_at:string};
+export type OccurrenceRow={id:string;owner:string;rule_id:string;due:string;status:string;title:string;amount:number;currency:string;kind:string;category:string};
+export type TripEntryRow={record_type:string;group_id:string;group_type:string;record_id:string;member_id:string;paylater?:string;date:string;title:string;category:string;currency:string;consumed:number;paid:number;amount:number;from_member:string;to_member:string;deleted:number};

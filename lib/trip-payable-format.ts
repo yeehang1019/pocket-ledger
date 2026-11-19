@@ -1,0 +1,1 @@
+export function payableMoney(amount:number,currency:string){const digits=['JPY','KRW','IDR'].includes(currency)?0:2;return (currency==='MYR'?'RM':currency)+' '+(amount/10**digits).toLocaleString('en-GB',{minimumFractionDigits:digits,maximumFractionDigits:digits});}

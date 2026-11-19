@@ -1,0 +1,66 @@
+import type {PocketBill} from '@/lib/pocket-domain';
+import {env} from 'cloudflare:workers';
+import {getChatGPTUser} from '@/app/chatgpt-auth';
+import {CURRENCIES,CATEGORIES,minor,today,validDate} from '@/lib/ledger-domain';
+export const dynamic='force-dynamic';
+const reply=(data:unknown,status=200)=>Response.json(data,{status,headers:{'Cache-Control':'private, no-store'}});
+function database(){if(!env.DB)throw Error('Database unavailable');return env.DB;}
+const tables={commitments:'pocket_commitments',bills:'pocket_bills',accounts:'pocket_accounts',templates:'pocket_templates',goals:'pocket_goals',categories:'pocket_categories',range_budgets:'range_budgets'} as const;
+export async function GET(){try{const u=await getChatGPTUser();if(!u)return reply({error:'请先登录'},401);const pairs=await Promise.all(Object.entries(tables).map(async([key,table])=>{const r=await database().prepare(`SELECT * FROM ${table} WHERE owner=? LIMIT 2001`).bind(u.userId).all();return [key,r.results]}));if(pairs.some(([,rows])=>(rows as unknown[]).length>2000))return reply({error:'记录过多，请先导出并整理账单'},413);return reply(Object.fromEntries(pairs));}catch(e){console.error('pocket.read',e);return reply({error:'暂时无法读取生活账单'},503);}}
+export async function POST(req:Request){try{
+ const u=await getChatGPTUser();if(!u)return reply({error:'请先登录'},401);const owner=u.userId,db=database();
+ if(req.headers.get('origin')!==new URL(req.url).origin)return reply({error:'请求来源无效'},403);
+ const raw=await req.text();if(raw.length>10000)return reply({error:'请求过大'},413);const b=JSON.parse(raw);if(!b||typeof b!=='object'||Array.isArray(b))return reply({error:'请求格式无效'},400);
+ if(b.action==='category'){const name=typeof b.name==='string'?b.name.trim():'';if(!name||name.length>24)return reply({error:'分类名称需为 1–24 字'},400);await db.prepare('INSERT OR IGNORE INTO pocket_categories(owner,name) VALUES (?,?)').bind(owner,name).run();return reply({ok:true});}
+ if(typeof b.id!=='string'||!/^[\w-]{8,100}$/.test(b.id))return reply({error:'无效记录标识'},400);
+ if(b.action==='remove'){
+  const table=(tables as Record<string,string>)[b.entity];if(!table||b.entity==='categories'||b.entity==='commitments')return reply({error:'无效记录类型'},400);
+  if(b.entity==='bills'){
+   const item=await db.prepare('SELECT * FROM pocket_bills WHERE owner=? AND id=?').bind(owner,b.id).first<PocketBill>();if(!item)return reply({error:'账单不存在'},404);
+   // A recharge with active usage cannot disappear underneath its deductions.
+   await db.prepare("UPDATE pocket_bills SET status='cancelled' WHERE owner=? AND id=? AND NOT EXISTS (SELECT 1 FROM pocket_bills c WHERE c.owner=? AND c.parent_id=? AND c.status='active')").bind(owner,b.id,owner,b.id).run();
+   const after=await db.prepare('SELECT status FROM pocket_bills WHERE owner=? AND id=?').bind(owner,b.id).first<PocketBill>();if(after?.status!=='cancelled')return reply({error:'这笔充值已有使用记录，请先取消使用记录'},409);
+  }else if(b.entity==='accounts'){
+   await db.prepare("DELETE FROM pocket_accounts WHERE owner=? AND id=? AND NOT EXISTS (SELECT 1 FROM pocket_bills WHERE owner=? AND account_id=? AND status='active')").bind(owner,b.id,owner,b.id).run();
+   if(await db.prepare('SELECT 1 FROM pocket_accounts WHERE owner=? AND id=?').bind(owner,b.id).first())return reply({error:'信用卡仍有关联账单'},409);
+  }else await db.prepare(`DELETE FROM ${table} WHERE owner=? AND id=?`).bind(owner,b.id).run();return reply({ok:true});
+ }
+ if(b.action==='settle'||b.action==='unsettle'||b.action==='activate'){
+  const record=await db.prepare('SELECT * FROM pocket_bills WHERE owner=? AND id=?').bind(owner,b.id).first<PocketBill>();if(!record)return reply({error:'账单不存在'},404);if(record.status!=='active'||(b.action==='unsettle'&&record.mode!=='postpaid')||(b.action==='settle'&&record.mode!=='postpaid')||(b.action==='activate'&&!['planned','postpaid'].includes(record.mode)))return reply({error:'账单状态不适用此操作'},409);
+  if(b.action==='unsettle'){await db.prepare("UPDATE pocket_bills SET paid_date='' WHERE owner=? AND id=? AND mode='postpaid'").bind(owner,b.id).run();return reply({ok:true});}
+  if(!validDate(b.date)||b.date>today())return reply({error:'请填写已经发生的日期'},400);
+  if(b.action==='settle')await db.prepare("UPDATE pocket_bills SET paid_date=? WHERE owner=? AND id=? AND mode='postpaid' AND status='active' AND paid_date=''").bind(b.date,owner,b.id).run();
+  else await db.prepare("UPDATE pocket_bills SET mode='postpaid',status='active',consumption_date=? WHERE owner=? AND id=? AND mode='planned' AND status='active'").bind(b.date,owner,b.id).run();return reply({ok:true});
+ }
+ const title=typeof b.title==='string'?b.title.trim():'';if(!title||title.length>100||!CURRENCIES.includes(b.currency))return reply({error:'请检查名称与币种'},400);
+ if(b.action==='account'){
+  if(!Number.isInteger(b.statement_day)||!Number.isInteger(b.due_day)||b.statement_day<1||b.statement_day>31||b.due_day<1||b.due_day>31)return reply({error:'账单日与还款日需为 1–31'},400);
+  await db.prepare('INSERT INTO pocket_accounts(owner,id,title,currency,statement_day,due_day) VALUES (?,?,?,?,?,?) ON CONFLICT(owner,id) DO UPDATE SET title=excluded.title,statement_day=excluded.statement_day,due_day=excluded.due_day').bind(owner,b.id,title,b.currency,b.statement_day,b.due_day).run();return reply({ok:true});
+ }
+ if(b.action==='goal'){
+  const target=minor(String(b.target),b.currency),saved=b.saved===''||String(b.saved)==='0'?0:minor(String(b.saved),b.currency);
+  await db.prepare('INSERT INTO pocket_goals(owner,id,title,currency,target,saved) VALUES (?,?,?,?,?,?) ON CONFLICT(owner,id) DO UPDATE SET title=excluded.title,target=excluded.target,saved=excluded.saved').bind(owner,b.id,title,b.currency,target,saved).run();return reply({ok:true});
+ }
+ const category=b.category;
+ if(typeof category!=='string'||(!(b.action==='range_budget'&&category==='all')&&!CATEGORIES.includes(category)&&!await db.prepare('SELECT 1 FROM pocket_categories WHERE owner=? AND name=?').bind(owner,category).first()))return reply({error:'无效分类'},400);
+ const amount=minor(String(b.amount),b.currency);
+ if(b.action==='template'){await db.prepare('INSERT INTO pocket_templates(owner,id,title,currency,category,amount) VALUES (?,?,?,?,?,?) ON CONFLICT(owner,id) DO UPDATE SET title=excluded.title,category=excluded.category,amount=excluded.amount').bind(owner,b.id,title,b.currency,category,amount).run();return reply({ok:true});}
+ if(b.action==='range_budget'){
+  if(!validDate(b.start)||!validDate(b.end)||b.start>b.end)return reply({error:'请检查预算日期范围'},400);
+  await db.prepare('INSERT INTO range_budgets(owner,id,title,start,end,currency,category,amount) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(owner,id) DO UPDATE SET title=excluded.title,start=excluded.start,end=excluded.end,category=excluded.category,amount=excluded.amount').bind(owner,b.id,title,b.start,b.end,b.currency,category,amount).run();return reply({ok:true});
+ }
+ if(b.action!=='bill'||!['planned','postpaid','prepaid','wallet','use'].includes(b.mode)||!validDate(b.consumption_date)||((b.mode==='postpaid'||b.mode==='wallet'||b.mode==='use')&&b.consumption_date>today()))return reply({error:'请检查账单类型与消费日期'},400);
+ const paid=b.paid_date||'',due=b.due_date||'',account=b.account_id||'',parent=b.parent_id||'';
+ if((paid&&(!validDate(paid)||paid>today()))||(due&&!validDate(due))||(['prepaid','wallet'].includes(b.mode)&&!paid)||(['planned','use'].includes(b.mode)&&paid))return reply({error:'请检查付款／到期日期；预付需要实际付款日期'},400);
+ if(account&&!['postpaid','planned'].includes(b.mode))return reply({error:'信用卡只用于后付消费或未来计划'},400);
+ if(account&&!await db.prepare('SELECT 1 FROM pocket_accounts WHERE owner=? AND id=? AND currency=?').bind(owner,account,b.currency).first())return reply({error:'信用卡不存在或币种不一致'},400);
+ if(b.mode==='use'){
+  const wallet=await db.prepare("SELECT * FROM pocket_bills WHERE owner=? AND id=? AND mode='wallet' AND status='active'").bind(owner,parent).first<PocketBill>();if(!wallet||wallet.currency!==b.currency)return reply({error:'预付余额不存在或币种不一致'},400);if(b.consumption_date<wallet.paid_date)return reply({error:'使用日期不能早于充值日期'},400);
+  await db.prepare(`INSERT OR IGNORE INTO pocket_bills(owner,id,title,mode,category,amount,currency,consumption_date,due_date,paid_date,status,account_id,parent_id,created_at) SELECT ?,?,?,?, ?,?,?,?,?,'','active','',?,? WHERE EXISTS (SELECT 1 FROM pocket_bills p WHERE p.owner=? AND p.id=? AND p.status='active' AND p.amount-COALESCE((SELECT SUM(c.amount) FROM pocket_bills c WHERE c.owner=p.owner AND c.parent_id=p.id AND c.status='active'),0)>=?)`).bind(owner,b.id,title,b.mode,category,amount,b.currency,b.consumption_date,due,parent,new Date().toISOString(),owner,parent,amount).run();
+  if(!await db.prepare('SELECT 1 FROM pocket_bills WHERE owner=? AND id=?').bind(owner,b.id).first())return reply({error:'预付余额不足，请刷新后重试'},409);
+ }else{
+  if(parent)return reply({error:'只有预付使用可以关联充值'},400);
+  await db.prepare("INSERT OR IGNORE INTO pocket_bills(owner,id,title,mode,category,amount,currency,consumption_date,due_date,paid_date,status,account_id,parent_id,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,'active',?,'',?)").bind(owner,b.id,title,b.mode,category,amount,b.currency,b.consumption_date,due,paid,account,new Date().toISOString()).run();
+ }
+ return reply({ok:true});
+ }catch(e){if(e instanceof SyntaxError)return reply({error:'请求格式无效'},400);if(e instanceof Error&&/金额|小数|整数/.test(e.message))return reply({error:e.message},400);console.error('pocket.write',e);return reply({error:'保存失败，请保留输入并重试'},503);}}

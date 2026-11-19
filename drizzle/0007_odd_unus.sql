@@ -1,0 +1,1 @@
+ALTER TABLE `trip_entries` ADD `paylater` text DEFAULT '' NOT NULL;

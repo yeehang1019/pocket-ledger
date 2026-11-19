@@ -1,0 +1,3 @@
+.overview-due-shortcut { margin:12px 0; }
+.overview-due-shortcut a { display:inline-flex; align-items:center; min-height:44px; padding:6px 14px; border-radius:16px; color:var(--app-ink,inherit); font-size:15px; font-weight:600; background:var(--app-surface,transparent); }
+#overview-payment-list { scroll-margin-top:88px; }
