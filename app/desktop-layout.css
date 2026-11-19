@@ -25,17 +25,6 @@
  :root[data-world] .page-heading>.primary,:root[data-world] .toolbar-add,:root[data-world] .mobile-month-picker{display:none!important}
  :root[data-world] .toolbar{justify-content:flex-end!important;margin:8px 0 0!important;min-height:44px;gap:12px}
  :root[data-world] .toolbar-end{margin-left:0!important}
- :root[data-world] .overview-intro .my-spending-hero{display:grid!important;grid-template-columns:minmax(0,1.15fr) minmax(0,1fr);column-gap:32px;align-items:end;padding:10px 0 0!important}
- :root[data-world] .spending-title{grid-column:1;grid-row:1;justify-content:flex-start!important}
- :root[data-world] .spending-title>span:last-child{display:none}
- :root[data-world] .hero-spending-main{grid-column:1;grid-row:2;padding-top:6px!important}
- :root[data-world] .overview-intro .hero-spending-main h2{font-size:clamp(48px,4.7vw,64px)!important}
- :root[data-world] .source-breakdown{display:contents}
- :root[data-world] .source-proportion{grid-column:1;grid-row:3;margin:0 0 10px;height:8px}
- :root[data-world] .overview-intro .spending-sources{grid-column:2;grid-row:1 / 4;align-self:end;margin:0!important}
- :root[data-world] .content-grid{display:grid!important;grid-template-columns:minmax(0,1fr) minmax(0,1fr)!important;gap:24px!important;align-items:start;margin-top:32px!important}
- :root[data-world] .overview-records{grid-column:2;grid-row:1;min-width:0}
- :root[data-world] .overview-due{grid-column:1;grid-row:1;min-width:0}
  :root[data-world] .overview-records>.panel{padding:0!important;background:none!important;border:0!important}
  :root[data-world] .overview-records>.panel>.panel-heading{padding:0 4px!important;margin-bottom:14px}
  :root[data-world] .overview-records>.panel:not(.spending){border-radius:24px;overflow:hidden}
@@ -68,4 +57,13 @@
  :root[data-world] .workspace{max-width:640px!important;margin-inline:auto!important}
  :root[data-world] .left-dock .navigation{left:calc(50% - 306px)!important;right:calc(50% - 234px)!important}
  :root[data-world] .mobile-entry.navigation-add{right:calc(50% - 306px)!important}
+}
+
+@media(min-width:1200px){
+ :root[data-world] .overview-intro .my-spending-hero{display:grid!important;grid-template-columns:minmax(0,1.15fr) minmax(0,1fr);column-gap:32px;align-items:end;padding:10px 0 0!important}
+ :root[data-world] .spending-title{grid-column:1;grid-row:1}
+ :root[data-world] .hero-spending-main{grid-column:1;grid-row:2}
+ :root[data-world] .source-breakdown{display:contents}
+ :root[data-world] .source-proportion{grid-column:1;grid-row:3}
+ :root[data-world] .overview-intro .spending-sources{grid-column:2;grid-row:1 / 4;align-self:end;margin:0!important}
 }

@@ -1,3 +1,81 @@
 .overview-due-shortcut { margin:12px 0; }
 .overview-due-shortcut a { display:inline-flex; align-items:center; min-height:44px; padding:6px 14px; border-radius:16px; color:var(--app-ink,inherit); font-size:15px; font-weight:600; background:var(--app-surface,transparent); }
 #overview-payment-list { scroll-margin-top:88px; }
+
+:root[data-world] .overview-intro .hero-spending-main > div:first-child {
+  width: 100%;
+  min-width: 0;
+  container-type: inline-size;
+}
+
+:root[data-world] .overview-intro .hero-spending-main h2 {
+  font-size: clamp(2rem, 11cqi, 4rem) !important;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
+}
+
+:root[data-world] .content-grid {
+  display: grid !important;
+  grid-template-columns: minmax(0, 1fr) !important;
+  align-items: start;
+  gap: 24px;
+}
+:root[data-world] .overview-due,
+:root[data-world] .overview-records { min-width: 0; }
+:root[data-world] .overview-due { margin-top: 0; scroll-margin-block-start: 1rem; }
+:root[data-world] .content-grid[data-urgent] .overview-due .finance-summary {
+  outline: 1px solid color-mix(in srgb, var(--red) 45%, transparent);
+  outline-offset: 4px;
+}
+
+.my-spending-hero:has([data-source="manual"]:is(:hover,:focus-visible)) .source-segment:not(.source-manual),
+.my-spending-hero:has([data-source="fixed"]:is(:hover,:focus-visible)) .source-segment:not(.source-fixed),
+.my-spending-hero:has([data-source="tripshare"]:is(:hover,:focus-visible)) .source-segment:not(.source-tripshare) {
+  opacity: .35;
+}
+
+.ledger-layout .ledger-tools { grid-column: 2; grid-row: 1; min-width: 0; }
+.ledger-layout .ledger-list { grid-column: 1; grid-row: 1; min-width: 0; }
+.filter-title { display: flex; align-items: center; gap: .5rem; margin: 0 0 1rem; font-size: .875rem; }
+.ledger-tools .filter-body { display: grid; gap: .75rem; grid-template-columns: minmax(0, 1fr); }
+.ledger-tools .ledger-search { margin: 0 !important; }
+.ledger-tools .ledger-search:focus-within { outline: 2px solid var(--app-text); outline-offset: 2px; }
+.advanced-filters { grid-column: 1 / -1; }
+.advanced-filters > summary { cursor: pointer; min-height: 44px; align-content: center; }
+.ledger-tools .advanced-filters .filters { grid-template-columns: minmax(0, 1fr); margin: 0 0 .5rem; }
+.ledger-tools .reset-filters { min-height: 44px; }
+
+.bill-income-section:not(:empty) { margin-block-start: 1.5rem; }
+.settings-page [id] { scroll-margin-block-start: 1rem; }
+.settings-index { display: flex; flex-wrap: wrap; gap: .25rem 1rem; margin-block: .75rem 1.25rem; }
+.settings-index a { display: inline-flex; align-items: center; min-height: 44px; text-underline-offset: .2em; }
+.settings-group { display: grid; gap: .75rem; margin-block-end: 1.25rem; }
+.settings-group > h2, .settings-group h3 { margin: 0; }
+.settings-group > h2 { font-size: 1.125rem; }
+.settings-group h3 { font-size: 1rem; }
+.world-choice .world-choice-preview {
+  width: auto;
+  min-width: 78px;
+  height: auto;
+  padding: 9px 7px;
+  gap: 3px;
+}
+.world-choice-preview b { font-size: .75rem; font-variant-numeric: tabular-nums; }
+.world-choice-preview i { width: 18px; height: 3px; background: currentColor; border-radius: 3px; }
+.world-choice-neon .world-choice-preview { background: #181535; color: #ead9ff; }
+.world-choice-glass .world-choice-preview { background: #ececf1; color: #21212b; }
+.trip-preview-dialog label { display: flex !important; align-items: center; gap: .5rem; min-height: 44px; overflow-wrap: anywhere; }
+
+@media (min-width: 1200px) {
+  :root[data-world] .content-grid { grid-template-columns: repeat(2,minmax(0,1fr)) !important; }
+}
+
+@media (max-width: 1023px) {
+  .ledger-layout { grid-template-columns: minmax(0,1fr) !important; }
+  .ledger-layout .ledger-tools, .ledger-layout .ledger-list { grid-column: 1; grid-row: auto; }
+  .ledger-layout .ledger-tools { position: static; }
+  .ledger-tools .advanced-filters .filters { grid-template-columns: repeat(auto-fit,minmax(min(100%,9rem),1fr)); }
+  .ledger-tools .ledger-search input { min-height: 28px; }
+  :root[data-world] .entry-dialog[data-entry-sheet=true] .quick-categories { scrollbar-width: thin; }
+}
