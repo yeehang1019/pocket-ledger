@@ -62,4 +62,16 @@ await test('PayLater metadata is owner-scoped, validated before a page writes, a
  pages=[{body:{schema_version:1,mode:'incremental',entries:[{...entry,paylater:{...entry.paylater,months:0}}],next_cursor:'invalid-finance',has_more:false}}];assert.equal((await sync()).status,503);assert.equal(sql.prepare('SELECT cursor FROM trip_sync').get().cursor,'finance-cursor');
  pages=[{body:{schema_version:1,mode:'incremental',entries:[{...entry,paylater:null}],next_cursor:'ordinary-cursor',has_more:false}}];assert.equal((await sync()).status,200);assert.equal(sql.prepare("SELECT paylater FROM trip_entries WHERE record_id='financed-expense'").get().paylater,'');
 });
+await test('TripShare fallback tombstones (unresolvable payment/expense) remove the stored rows and replay safely',async()=>{
+ user={userId:'ledger-a',email:'yeehang32@gmail.com'};
+ const live={...payment,payment_id:'ghost-payment'},liveExpense={...expense(4000),expense_id:'ghost-expense'};
+ pages=[{body:{schema_version:1,mode:'incremental',entries:[live,liveExpense],next_cursor:'live',has_more:false}}];assert.equal((await sync()).status,200);
+ const count=()=>sql.prepare("SELECT COUNT(*) AS n FROM trip_entries WHERE record_id IN ('ghost-payment','ghost-expense')").get().n;assert.equal(count(),2);
+ // Exact shapes emitted by TripShare v1 when the record is gone or no longer involves this member.
+ const payTomb={record_type:'payment',group_id:'daily-1',group_type:'daily',payment_id:'ghost-payment',member_id:'member-a',from_member_id:null,to_member_id:null,amount_minor:0,currency:'MYR',date:'2026-11-20',deleted:true,expense_ids:[],change_seq:9,updated_at:'2026-11-20T08:00:00.000Z'};
+ const expTomb={record_type:'expense',group_id:'daily-1',group_type:'daily',expense_id:'ghost-expense',member_id:'member-a',key:['daily-1','ghost-expense','member-a'],date:'2026-11-20',title:null,category:null,currency:'MYR',consumed_minor:0,paid_minor:0,deleted:true,change_seq:10,updated_at:'2026-11-20T08:00:00.000Z'};
+ for(const cursor of ['tomb-1','tomb-2']){pages=[{body:{schema_version:1,mode:'incremental',entries:[payTomb,expTomb],next_cursor:cursor,has_more:false}}];assert.equal((await sync()).status,200);}
+ assert.equal(count(),2);assert.equal(sql.prepare("SELECT COUNT(*) AS n FROM trip_entries WHERE record_id IN ('ghost-payment','ghost-expense') AND deleted=1").get().n,2);
+ assert.equal(sql.prepare('SELECT cursor FROM trip_sync').get().cursor,'tomb-2');
+});
 globalThis.fetch=originalFetch;sql.close();
