@@ -8,8 +8,8 @@ const domain=await import('data:text/javascript;base64,'+Buffer.from(transpile(r
 globalThis.__commitmentDomain=domain;
 const finance=await import('data:text/javascript;base64,'+Buffer.from(transpile(readFileSync('lib/commitments.ts','utf8')).replace(/^import .*;\n/gm,'const {validDate}=globalThis.__commitmentDomain;\n')).toString('base64'));
 const sql=new DatabaseSync(':memory:');for(const f of readdirSync('drizzle').filter(f=>f.endsWith('.sql')).sort())sql.exec(readFileSync('drizzle/'+f,'utf8'));
-let hook=null,user='owner-a',failWrites=false,failAfter=0;
-const wrap=(q,p=[])=>({bind:(...args)=>wrap(q,args),first:async()=>sql.prepare(q).get(...p)||null,all:async()=>({results:sql.prepare(q).all(...p)}),run:async()=>{if(failWrites||failAfter&&--failAfter===0)throw Error('simulated database outage');const r=sql.prepare(q).run(...p);return {meta:{changes:r.changes}}}});
+let hook=null,beforeWrite=null,user='owner-a',failWrites=false,failAfter=0;
+const wrap=(q,p=[])=>({bind:(...args)=>wrap(q,args),first:async()=>sql.prepare(q).get(...p)||null,all:async()=>({results:sql.prepare(q).all(...p)}),run:async()=>{if(failWrites||failAfter&&--failAfter===0)throw Error('simulated database outage');if(beforeWrite){const h=beforeWrite;beforeWrite=null;h();}const r=sql.prepare(q).run(...p);return {meta:{changes:r.changes}}}});
 const DB={prepare:q=>wrap(q),batch:async statements=>{if(hook){const h=hook;hook=null;h();}sql.exec('BEGIN');try{for(const s of statements)await s.run();sql.exec('COMMIT');}catch(e){sql.exec('ROLLBACK');throw e}}};
 const source=transpile(readFileSync('app/api/commitments/route.ts','utf8').replace(/^import .*;\n/gm,'')).replace(/export /g,'');
 const {transactionVersion}=await import('data:text/javascript;base64,'+Buffer.from(transpile(readFileSync('lib/transaction-version.ts','utf8'))).toString('base64'));
@@ -200,5 +200,127 @@ await test('variable bills save just the amount, or explicitly book one expense 
   assert.equal(plan(id).paid_date,body.date);
   assert.equal((await post({...body,action:'rulepay'})).status,409);
  }
+});
+const monthly={action:'invoice',provider:'spaylater',amount:'309',currency:'MYR',due:'2026-10-31'};
+const insertInvoice=sql.prepare("INSERT INTO pocket_commitments(owner,id,kind,title,currency,source_key,data,status) VALUES (?,?,'paylater','Invoice',?,?,?,?)");
+await test('active invoice uniqueness survives concurrent create and blocks same-month restore',async()=>{
+ user='invoice-unique-race';
+ const invoice={...monthly,id:'invoice-unique-first'};
+ const competing='invoice-unique-other';
+ const data={provider:monthly.provider,date:'2026-10-23',total:30900,months:1,first_due:monthly.due,rows:finance.planRows(competing,30900,1,monthly.due),covers:[]};
+ beforeWrite=()=>insertInvoice.run(user,competing,'MYR','invoice:spaylater:2026-10',JSON.stringify(data),'active');
+ assert.equal((await post(invoice)).status,409);
+ assert.equal(stored(invoice.id),undefined);
+ assert.equal((await post({id:competing,action:'cancel',revision:0})).status,200);
+ assert.equal((await post(invoice)).status,200);
+ assert.equal((await post({id:competing,action:'restore',revision:1})).status,409);
+ assert.equal(stored(competing).status,'cancelled');
+ assert.equal((await post({...invoice,id:'invoice-unique-sgd',currency:'SGD'})).status,200);
+});
+await test('invoice restore rejects coverage that another active invoice acquired',async()=>{
+ user='invoice-overlap-owner';
+ const purchase={...base,id:'invoice-overlap-item',months:1};
+ const invoice={...monthly,id:'invoice-overlap-first'};
+ assert.equal((await post(purchase)).status,200);
+ assert.equal((await post(invoice)).status,200);
+ assert.equal((await post({id:invoice.id,action:'cancel',revision:0})).status,200);
+ const data=plan(invoice.id),competitor='invoice-overlap-other';
+ // Simulate a historical invoice with an overlapping link under a different key.
+ const due='2026-11-30';
+ beforeWrite=()=>insertInvoice.run(user,competitor,'MYR','invoice:spaylater:2026-11',JSON.stringify({...data,first_due:due,rows:finance.planRows(competitor,data.total,1,due)}),'active');
+ assert.equal((await post({id:invoice.id,action:'restore',revision:1})).status,409);
+ assert.equal(stored(invoice.id).status,'cancelled');
+ assert.equal(stored(competitor).status,'active');
+});
+await test('monthly invoice edits allow one row in the original month only',async()=>{
+ user='invoice-edit-month-owner';
+ const invoice={...monthly,id:'invoice-edit-month'};
+ assert.equal((await post(invoice)).status,200);
+ const [row]=plan(invoice.id).rows,edit={id:invoice.id,action:'plan',revision:0};
+ assert.equal((await post({...edit,rows:[{...row,due:'2026-11-01'}]})).status,409);
+ assert.equal((await post({...edit,rows:finance.planRows(invoice.id,row.amount,2,'2026-10-01')})).status,409);
+ assert.equal((await post({...edit,rows:[{...row,due:'2026-10-30'}]})).status,200);
+ assert.equal(plan(invoice.id).first_due,'2026-10-30');
+});
+await test('cancelled plans cannot accept payment',async()=>{
+ user='cancelled-payment-owner';
+ const purchase={...base,id:'cancelled-payment-item',months:1};
+ assert.equal((await post(purchase)).status,200);
+ assert.equal((await post({id:purchase.id,action:'cancel',revision:0})).status,200);
+ const [row]=plan(purchase.id).rows;
+ assert.equal((await post({id:purchase.id,action:'pay',revision:1,row_id:row.id,date:'2026-10-23'})).status,409);
+ assert.equal(plan(purchase.id).rows[0].paid_date,'');
+});
+await test('purchase edits lose against an invoice created before the write',async()=>{
+ user='covered-purchase-race';
+ const purchase={...base,id:'covered-purchase-item',months:1};
+ assert.equal((await post(purchase)).status,200);
+ const original=stored(purchase.id),data=plan(purchase.id);
+ const tx=()=>sql.prepare('SELECT * FROM transactions WHERE id=?').get(purchase.id);
+ const originalTx=tx(),invoice='covered-purchase-invoice';
+ const invoiceData={...data,covers:[{plan:purchase.id,row:data.rows[0].id,amount:data.total}]};
+ hook=()=>insertInvoice.run(user,invoice,'MYR','invoice:spaylater:2026-10',JSON.stringify(invoiceData),'active');
+ const edit={...purchase,edit:true,revision:0,edit_version:transactionVersion(originalTx),title:'changed'};
+ assert.equal((await post(edit)).status,409);
+ assert.equal((await post(edit)).status,409);
+ assert.equal((await post({id:purchase.id,action:'cancel',revision:0})).status,409);
+ assert.equal((await post({id:purchase.id,action:'unpay',row_id:data.rows[0].id,revision:0})).status,409);
+ assert.deepEqual(stored(purchase.id),original);
+ assert.deepEqual(tx(),originalTx);
+});
+await test('direct plan edits recheck invoice coverage at write time',async()=>{
+ user='covered-plan-race';
+ const purchase={...base,id:'covered-plan-item',months:1};
+ assert.equal((await post(purchase)).status,200);
+ const original=stored(purchase.id),data=plan(purchase.id),[row]=data.rows;
+ beforeWrite=()=>insertInvoice.run(user,'covered-plan-invoice','MYR','invoice:spaylater:2026-10',JSON.stringify({...data,covers:[{plan:purchase.id,row:row.id,amount:row.amount}]}),'active');
+ assert.equal((await post({action:'plan',id:purchase.id,revision:0,rows:[{...row,due:'2026-10-30'}]})).status,409);
+ assert.deepEqual(stored(purchase.id),original);
+});
+await test('invoice coverage matches the plan and row together',async()=>{
+ user='covered-row-id-owner';
+ const first={...base,id:'covered-row-first',months:1},second={...first,id:'covered-row-second',payment_method:'other'};
+ assert.equal((await post(first)).status,200);
+ assert.equal((await post(second)).status,200);
+ const [row]=plan(first.id).rows;
+ assert.equal((await post({action:'plan',id:second.id,revision:0,rows:[row]})).status,200);
+ const invoice={...monthly,id:'covered-row-invoice'};
+ assert.equal((await post(invoice)).status,200);
+ const list=sql.prepare('SELECT * FROM pocket_commitments WHERE owner=?').all(user);
+ const due=finance.paymentDue(list,[],[],[],'2026-10-23','2026-10-31',domain.dates);
+ assert.deepEqual(new Set(due.map(d=>d.parent.id)),new Set([invoice.id,second.id]));
+});
+await test('an invoice cannot capture an instalment changed before the invoice INSERT',async()=>{
+ user='invoice-source-race';
+ const purchase={...base,id:'invoice-source-item',months:1};
+ assert.equal((await post(purchase)).status,200);
+ const data=plan(purchase.id);data.rows[0].due='2026-11-01';data.first_due=data.rows[0].due;
+ beforeWrite=()=>sql.prepare('UPDATE pocket_commitments SET data=?,revision=revision+1 WHERE owner=? AND id=?').run(JSON.stringify(data),user,purchase.id);
+ const invoice={...monthly,id:'invoice-source-race'};
+ assert.equal((await post(invoice)).status,409);
+ assert.equal(stored(invoice.id),undefined);
+});
+for(const action of ['purchase','movement']){
+ await test(action+' rolls back when the linked transaction ID collides',async()=>{
+  user='linked-collision-'+action;
+  const id='linked-collision-'+action,movement_id='collision-movement';
+  if(action==='movement')assert.equal((await post({action:'deposit',id,amount:'100',currency:'MYR',date:'2026-10-01'})).status,200);
+  const before=stored(id),txid=action==='purchase'?id:'deposit:'+id+':'+movement_id;
+  sql.prepare("INSERT INTO transactions(id,owner,title,amount,currency,kind,category,date,created_at) VALUES (?,'another-owner','Other',100,'MYR','expense','其他','2026-10-10','now')").run(txid);
+  const body=action==='purchase'?{...base,id}:{action,id,movement_id,revision:0,kind:'rent',amount:'10',date:'2026-10-20'};
+  assert.equal((await post(body)).status,409);
+  assert.deepEqual(stored(id),before);
+  assert.equal(sql.prepare('SELECT owner FROM transactions WHERE id=?').get(txid).owner,'another-owner');
+ });
+}
+await test('a linked write that affects zero rows aborts the commitment batch',async()=>{
+ user='linked-zero-owner';
+ const purchase={...base,id:'linked-zero-purchase'};
+ sql.exec("CREATE TEMP TRIGGER skip_linked_insert BEFORE INSERT ON transactions WHEN NEW.id='linked-zero-purchase' BEGIN SELECT RAISE(IGNORE); END");
+ try{
+  assert.equal((await post(purchase)).status,503);
+  assert.equal(stored(purchase.id),undefined);
+  assert.equal(sql.prepare('SELECT 1 FROM transactions WHERE id=?').get(purchase.id),undefined);
+ }finally{sql.exec('DROP TRIGGER skip_linked_insert');}
 });
 sql.close();delete globalThis.__commitmentDomain;

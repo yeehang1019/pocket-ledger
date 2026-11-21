@@ -1,4 +1,5 @@
 import {integer,sqliteTable,text,index,uniqueIndex} from 'drizzle-orm/sqlite-core';
+import {sql} from 'drizzle-orm';
 export const transactions=sqliteTable('transactions',{
  id:text('id').primaryKey(),owner:text('owner').notNull(),title:text('title').notNull(),amount:integer('amount').notNull(),currency:text('currency').notNull(),kind:text('kind').notNull(),category:text('category').notNull(),date:text('date').notNull(),note:text('note').notNull().default(''),ruleId:text('rule_id'),occurrence:text('occurrence'),deleted:integer('deleted').notNull().default(0),createdAt:text('created_at').notNull()
 },t=>[index('tx_owner_date').on(t.owner,t.date),uniqueIndex('tx_occurrence').on(t.owner,t.ruleId,t.occurrence)]);
@@ -40,7 +41,8 @@ export const rangeBudgets=sqliteTable('range_budgets',{
 },t=>[uniqueIndex('range_budget_key').on(t.owner,t.id)]);
 export const pocketCommitments=sqliteTable('pocket_commitments',{
  owner:text('owner').notNull(),id:text('id').notNull(),kind:text('kind').notNull(),title:text('title').notNull(),currency:text('currency').notNull(),sourceKey:text('source_key').notNull().default(''),sourceSignature:text('source_signature').notNull().default(''),data:text('data').notNull(),revision:integer('revision').notNull().default(0),status:text('status').notNull().default('active'),mutation:text('mutation').notNull().default(''),
-},t=>[uniqueIndex('commitment_key').on(t.owner,t.id),index('commitment_owner').on(t.owner)]);
+},t=>[uniqueIndex('commitment_key').on(t.owner,t.id),index('commitment_owner').on(t.owner),
+ uniqueIndex('commitment_active_invoice_key').on(t.owner,t.sourceKey,t.currency).where(sql`${t.kind} = 'paylater' AND ${t.status} = 'active' AND ${t.sourceKey} GLOB 'invoice:*'`)]);
 
 // Read-only TripShare debt mirrors, separate from consumption transactions.
 export const tripSyncSettings=sqliteTable('trip_sync_settings',{owner:text('owner').primaryKey(),connection:text('connection').notNull().default('tripshare'),activated:integer('activated').notNull().default(0),alsoReceive:integer('also_receive').notNull().default(0),version:text('version').notNull().default(''),lastCompleted:text('last_completed').notNull().default(''),status:text('status').notNull().default('review_required'),error:text('error').notNull().default(''),lease:text('lease').notNull().default(''),lockUntil:integer('lock_until').notNull().default(0)});
