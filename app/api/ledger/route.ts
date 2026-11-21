@@ -16,8 +16,8 @@ const ledgerSnapshot='id=? AND owner=? AND deleted=0 AND title=? AND amount=? AN
 const unmanagedSnapshot=ledgerSnapshot+' AND '+noLinkedPlan;
 const noPaidRows=`NOT EXISTS (SELECT 1 FROM json_each(p.data,'$.rows') r WHERE COALESCE(json_extract(r.value,'$.paid_date'),'')<>'')`;
 async function auth(){const user=await getChatGPTUser();return user?.userId;}
-async function reconcile(owner:string,ruleId?:string){
- const database=db(),now=today(); const rows=await database.prepare("SELECT * FROM rules WHERE owner=? AND status='active'").bind(owner).all<RuleRow>();
+async function reconcile(owner:string,now:string,ruleId?:string){
+ const database=db(); const rows=await database.prepare("SELECT * FROM rules WHERE owner=? AND status='active'").bind(owner).all<RuleRow>();
  for(const r of rows.results){
  if((ruleId&&r.id!==ruleId)||r.processed_through>=now)continue;
  const due=dates(r.start,r.frequency,now,r.month_days).filter(d=>d>r.processed_through);const statements=[];
@@ -29,11 +29,36 @@ async function reconcile(owner:string,ruleId?:string){
  await database.prepare('UPDATE rules SET processed_through=MAX(processed_through,?) WHERE id=? AND owner=? AND revision=? AND status=\'active\'').bind(now,r.id,owner,r.revision).run();
  }
 }
+const occurrenceHistoryLimit=5000;
+async function readOccurrences(database:D1Database,owner:string){
+ const result=await database.prepare(`WITH classified AS (
+  SELECT o.*, CASE WHEN o.status IN ('pending','unpaid') OR
+   (o.status='awaiting' AND o.kind='income') OR
+   (o.status IN ('awaiting','recorded') AND o.kind='expense' AND NOT EXISTS (
+    SELECT 1 FROM pocket_commitments p WHERE p.owner=o.owner AND p.id='rule:'||o.rule_id||':'||o.due
+    AND p.kind='confirmation' AND CASE WHEN p.status='ignored' THEN 1 WHEN json_valid(p.data) THEN
+     COALESCE(json_extract(p.data,'$.paid_date'),'')<>'' AND json_extract(p.data,'$.amount')=o.amount
+    ELSE 0 END
+   )) THEN 1 ELSE 0 END AS unresolved
+  FROM occurrences o WHERE o.owner=?
+ ), ranked AS (
+  SELECT *,ROW_NUMBER() OVER (PARTITION BY unresolved ORDER BY due DESC,id DESC) AS position FROM classified
+ ) SELECT * FROM ranked WHERE unresolved=1 OR position<=? ORDER BY due DESC,id DESC`)
+ .bind(owner,occurrenceHistoryLimit+1).all<OccurrenceRow&{unresolved:number;position:number}>();
+ const occurrences:OccurrenceRow[]=[];
+ let truncated=false;
+ for(const {unresolved,position,...row} of result.results){
+  if(!unresolved&&position>occurrenceHistoryLimit)truncated=true;
+  else occurrences.push(row);
+ }
+ return {occurrences,pending:occurrences.filter(o=>o.status==='pending').reverse(),truncated};
+}
 export async function GET(){try{const owner=await auth();if(!owner)return response({error:'请先登录验证'},401);
- const database=db(); const [tx,rules,occ,budgets,trip,tripState,groupLabels,allOccurrences]=await Promise.all([database.prepare('SELECT * FROM transactions WHERE owner=? AND deleted=0 ORDER BY date DESC,created_at DESC LIMIT 10001').bind(owner).all<TransactionRow>(),database.prepare('SELECT * FROM rules WHERE owner=? ORDER BY created_at DESC').bind(owner).all(),database.prepare("SELECT * FROM occurrences WHERE owner=? AND status='pending' ORDER BY due").bind(owner).all(),database.prepare('SELECT month,currency,category,amount FROM budgets WHERE owner=? ORDER BY month DESC LIMIT 240').bind(owner).all(),database.prepare('SELECT * FROM trip_entries WHERE owner=? AND deleted=0 ORDER BY date DESC LIMIT 10001').bind(owner).all(),database.prepare('SELECT status,last_completed FROM trip_sync WHERE owner=?').bind(owner).first<{status:string;last_completed:string}>(),database.prepare('SELECT group_id,label FROM trip_group_labels WHERE owner=?').bind(owner).all(),database.prepare("SELECT * FROM occurrences WHERE owner=? ORDER BY due DESC LIMIT 5001").bind(owner).all()]);
- return response({transactions:tx.results.slice(0,10000).map(t=>({...t,edit_version:transactionVersion(t)})),truncated:tx.results.length>10000||trip.results.length>10000,rules:rules.results,occurrences:allOccurrences.results,pending:occ.results,budgets:budgets.results,trip_entries:trip.results.slice(0,10000),trip_sync:tripState||null,group_labels:groupLabels.results,today:today()});
+ const database=db(); const [tx,rules,budgets,trip,tripState,groupLabels,terms]=await Promise.all([database.prepare('SELECT * FROM transactions WHERE owner=? AND deleted=0 ORDER BY date DESC,created_at DESC LIMIT 10001').bind(owner).all<TransactionRow>(),database.prepare('SELECT * FROM rules WHERE owner=? ORDER BY created_at DESC').bind(owner).all(),database.prepare('SELECT month,currency,category,amount FROM budgets WHERE owner=? ORDER BY month DESC LIMIT 240').bind(owner).all(),database.prepare('SELECT * FROM trip_entries WHERE owner=? AND deleted=0 ORDER BY date DESC LIMIT 10001').bind(owner).all(),database.prepare('SELECT status,last_completed FROM trip_sync WHERE owner=?').bind(owner).first<{status:string;last_completed:string}>(),database.prepare('SELECT group_id,label FROM trip_group_labels WHERE owner=?').bind(owner).all(),readOccurrences(database,owner)]);
+ return response({...terms,transactions:tx.results.slice(0,10000).map(t=>({...t,edit_version:transactionVersion(t)})),truncated:terms.truncated||tx.results.length>10000||trip.results.length>10000,rules:rules.results,budgets:budgets.results,trip_entries:trip.results.slice(0,10000),trip_sync:tripState||null,group_labels:groupLabels.results,today:today()});
  }catch(e){console.error('ledger.read',e);return response({error:'暂时无法读取账本，请稍后重试'},503);}}
 export async function POST(req:Request){try{
+ const businessDay=today();
  const owner=await auth();if(!owner)return response({error:'请先登录验证'},401);
  const origin=req.headers.get('origin');if(!origin||origin!==new URL(req.url).origin)return response({error:'请求来源无效'},403);
  if(Number(req.headers.get('content-length')||0)>16000)return response({error:'请求过大'},413);
@@ -58,7 +83,7 @@ export async function POST(req:Request){try{
   const amount=minor(String(b.amount),b.currency);
   await database.prepare('INSERT INTO budgets (owner,month,currency,category,amount) VALUES (?,?,?,?,?) ON CONFLICT(owner,month,currency,category) DO UPDATE SET amount=excluded.amount').bind(owner,b.month,b.currency,b.category,amount).run();return response({ok:true});
  }
- if(b.action==='sync'){await reconcile(owner);return response({ok:true});}
+ if(b.action==='sync'){await reconcile(owner,businessDay);return response({ok:true});}
  if(b.action==='delete'){
  const tx=await database.prepare('SELECT * FROM transactions WHERE id=? AND owner=?').bind(String(b.id),owner).first<TransactionRow>();
  if(!tx)return response({error:'记录不存在'},404);
@@ -94,14 +119,14 @@ export async function POST(req:Request){try{
  }
  if(b.action==='status'){
  if(!['active','paused','ended'].includes(b.status))return response({error:'无效状态'},400);
- await reconcile(owner);
+ await reconcile(owner,businessDay);
  // Resume starts now; dates while paused are deliberately not backfilled.
- const changed=await database.prepare("UPDATE rules SET status=?,processed_through=?,revision=revision+1 WHERE id=? AND owner=? AND revision=? AND status!='ended'").bind(b.status,today(),String(b.id),owner,b.revision??-1).run();if(!changed.meta.changes)return response({error:'规则已在其他设备修改，请重新载入'},409);return response({ok:true});
+ const changed=await database.prepare("UPDATE rules SET status=?,processed_through=?,revision=revision+1 WHERE id=? AND owner=? AND revision=? AND status!='ended'").bind(b.status,businessDay,String(b.id),owner,b.revision??-1).run();if(!changed.meta.changes)return response({error:'规则已在其他设备修改，请重新载入'},409);return response({ok:true});
  }
  if(b.action==='receive'){
   const o=await database.prepare("SELECT * FROM occurrences WHERE id=? AND owner=? AND kind='income' AND status IN ('pending','awaiting')").bind(String(b.id),owner).first<OccurrenceRow>();
   if(!o)return response({error:'本期收入已处理或不存在，请重新载入'},409);
-  if(!validDate(b.date)||b.date>today())return response({error:'请填写实际到账日期，不能是未来日期'},400);
+  if(!validDate(b.date)||b.date>businessDay)return response({error:'请填写实际到账日期，不能是未来日期'},400);
   const amount=b.amount!==undefined&&b.amount!==''?minor(String(b.amount),o.currency):o.amount;
   if(!Number.isSafeInteger(amount)||amount<=0)return response({error:'请填写实际到账金额'},400);
   await database.batch([
@@ -141,8 +166,8 @@ export async function POST(req:Request){try{
   if(existing.status==='ended')return response({error:'已结束的规则不能修改，请创建新规则'},409);
   if(!Number.isSafeInteger(b.revision)||b.revision!==existing.revision)return response({error:'规则已被其他操作修改，请刷新后再编辑'},409);
   // Finish overdue dates under the old terms. New terms apply strictly after today.
-  await reconcile(owner,id);
-  const updated=await database.prepare("UPDATE rules SET title=?,amount=?,currency=?,kind=?,category=?,start=?,frequency=?,month_days=?,mode=?,processed_through=MAX(processed_through,?),revision=revision+1 WHERE id=? AND owner=? AND revision=? AND status!='ended'").bind(b.title.trim(),amount,b.currency,b.kind,b.category,b.date,b.frequency,monthDays,b.mode,today(),id,owner,b.revision).run();
+  await reconcile(owner,businessDay,id);
+  const updated=await database.prepare("UPDATE rules SET title=?,amount=?,currency=?,kind=?,category=?,start=?,frequency=?,month_days=?,mode=?,processed_through=MAX(processed_through,?),revision=revision+1 WHERE id=? AND owner=? AND revision=? AND status!='ended'").bind(b.title.trim(),amount,b.currency,b.kind,b.category,b.date,b.frequency,monthDays,b.mode,businessDay,id,owner,b.revision).run();
   if(!updated.meta.changes)return response({error:'规则已被其他操作修改，请刷新后再编辑'},409);
   return response({ok:true});
  }
@@ -150,14 +175,14 @@ export async function POST(req:Request){try{
  await database.prepare('INSERT OR IGNORE INTO rules (id,owner,title,amount,currency,kind,category,start,frequency,month_days,mode,status,processed_through,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)').bind(id,owner,b.title.trim(),amount,b.currency,b.kind,b.category,b.date,b.frequency,monthDays,b.mode,'active','',new Date().toISOString()).run();
  const savedRule=await database.prepare('SELECT * FROM rules WHERE id=? AND owner=?').bind(id,owner).first<RuleRow>();
  if(!savedRule||JSON.stringify([savedRule.title,savedRule.amount,savedRule.currency,savedRule.kind,savedRule.category,savedRule.start,savedRule.frequency,savedRule.month_days,savedRule.mode,savedRule.status])!==JSON.stringify([b.title.trim(),amount,b.currency,b.kind,b.category,b.date,b.frequency,monthDays,b.mode,'active']))return response({error:'这个提交标识已有不同周期规则，请重新载入核对；未覆盖原规则'},409);
- await reconcile(owner);
+ await reconcile(owner,businessDay);
  }else{
- if(b.action!=='edit'&&b.date>today())return response({error:'实际交易不能使用未来日期，请创建周期账单'},400);
+ if(b.action!=='edit'&&b.date>businessDay)return response({error:'实际交易不能使用未来日期，请创建周期账单'},400);
  const note=String(b.note||'');if(note.length>500)return response({error:'备注最多 500 字'},400);
  if(b.action==='edit'){
  const existing=await database.prepare('SELECT * FROM transactions WHERE id=? AND owner=? AND deleted=0').bind(id,owner).first<TransactionRow>();
  if(!existing)return response({error:'记录不存在'},404);
- if(b.date>today()&&!(existing.rule_id&&existing.kind==='expense'&&b.kind==='expense'&&b.date===existing.date))return response({error:'不能把实际交易改成未来日期'},400);
+ if(b.date>businessDay&&!(existing.rule_id&&existing.kind==='expense'&&b.kind==='expense'&&b.date===existing.date))return response({error:'不能把实际交易改成未来日期'},400);
  if(b.edit_version!==transactionVersion(existing))return response({error:'这笔记录已在其他设备修改',current_version:transactionVersion(existing)},409);
  const guardValues=[id,owner,existing.title,existing.amount,existing.currency,existing.kind,existing.category,existing.date,existing.note||''];
  const results=await database.batch([

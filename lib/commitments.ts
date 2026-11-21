@@ -4,6 +4,7 @@ import type {PocketBill} from './pocket-domain';
 type ScheduledRule=Pick<RuleRow,'id'|'title'|'kind'|'currency'|'category'|'status'|'mode'|'amount'|'start'|'frequency'|'month_days'>;
 type Term=Omit<OccurrenceRow,'owner'>;
 export const paymentMethods:Record<string,string>={ordinary:'普通付款',spaylater:'SPayLater',grabpaylater:'Grab PayLater',other:'其他 PayLater'};
+const isPayLaterProvider=(provider:unknown)=>typeof provider==='string'&&provider!=='ordinary'&&Object.hasOwn(paymentMethods,provider);
 export type Instalment={id:string;due:string;amount:number;paid_date:string};
 export type PlanData={provider:string;total:number;date:string;months:number;first_due:string;rows:Instalment[];covers?:{plan:string;row:string;amount:number}[]};
 export type DepositData={amount:number;date:string;movements:{id:string;kind:'refund'|'deduct'|'rent';voided?:boolean;amount:number;date:string;note:string}[]};
@@ -14,27 +15,50 @@ export function planRows(id:string,total:number,months:number,first:string):Inst
  if(total<months)throw Error('每期金额必须至少为一个最小货币单位');
  return Array.from({length:months},(_,i)=>({id:`${id}:${i+1}`,due:monthlyDate(first,i),amount:Math.floor(total/months)+(i<total%months?1:0),paid_date:''}));
 }
-export function validateRows(rows:Instalment[],total:number){
- if(!Array.isArray(rows)||rows.length<1||rows.length>60||new Set(rows.map(r=>r.id)).size!==rows.length||rows.some(r=>typeof r.id!=='string'||r.id.length>250||!validDate(r.due)||!Number.isSafeInteger(r.amount)||r.amount<=0||r.paid_date&& !validDate(r.paid_date))||rows.reduce((n,r)=>n+r.amount,0)!==total)throw Error('各期金额必须大于零，合计须等于应还总额，日期必须有效');
+export function validateRows(rows:Instalment[],total:number,maxIdLength=250){
+ if(!Array.isArray(rows)||rows.length<1||rows.length>60||rows.some(r=>!r||typeof r.id!=='string'||r.id.length>maxIdLength||!validDate(r.due)||!Number.isSafeInteger(r.amount)||r.amount<=0||r.paid_date&& !validDate(r.paid_date))||new Set(rows.map(r=>r.id)).size!==rows.length||rows.reduce((n,r)=>n+r.amount,0)!==total)throw Error('各期金额必须大于零，合计须等于应还总额，日期必须有效');
 }
 export function invoiceRowsMatchMonth(rows:Instalment[],sourceKey:string){
  return rows.length===1&&rows[0].due.slice(0,7)===sourceKey.slice(-7);
 }
+export function tripPlanRows(id:string,p:{provider:unknown;total:unknown;months:unknown;first_due:unknown},date:string){
+ if(!p||!isPayLaterProvider(p.provider)||(p.provider==='grabpaylater'&&p.months!==1)||typeof p.total!=='number'||typeof p.months!=='number'||typeof p.first_due!=='string'||p.first_due<date)throw Error('Trip Share 分期资料无效');
+ return planRows(id,p.total,p.months,p.first_due);
+}
 export function tripPlan(entry:TripEntryRow):Commitment|null{
  if(entry.record_type!=='expense'||entry.deleted||!entry.paylater)return null;
- const p=JSON.parse(entry.paylater);if(!p||!Object.hasOwn(paymentMethods,p.provider)||p.provider==='ordinary'||!Number.isSafeInteger(p.total)||p.total<=0||!Number.isInteger(p.months)||!validDate(p.first_due))throw Error('Trip Share 分期资料无效');
+ const p=JSON.parse(entry.paylater);
  const id=`trip:${entry.group_id}:${entry.record_id}:${entry.member_id}`;
- const data:PlanData={provider:p.provider,total:p.total,date:entry.date,months:p.months,first_due:p.first_due,rows:planRows(id,p.total,p.months,p.first_due)};
+ const rows=tripPlanRows(id,p,entry.date);
+ const data:PlanData={provider:p.provider,total:p.total,date:entry.date,months:p.months,first_due:p.first_due,rows};
  return {id,kind:'paylater',title:entry.title,currency:entry.currency,source_key:id,source_signature:entry.paylater,data:JSON.stringify(data),revision:-1,status:'active'};
 }
-export function allCommitments(saved:Commitment[]=[],trip:TripEntryRow[]=[]){
- const imported=trip.map(tripPlan).filter((p):p is Commitment=>!!p),byId=new Map(imported.map(p=>[p.id,p]));
- const result=[...saved.map(p=>({...p,review:p.source_key.startsWith('trip:')&&(!byId.has(p.id)||byId.get(p.id)!.source_signature!==p.source_signature||byId.get(p.id)!.currency!==p.currency||JSON.parse(byId.get(p.id)!.data).date!==JSON.parse(p.data).date)})),...imported.filter(p=>!saved.some(s=>s.id===p.id))];
+function readPlan(p:Commitment,onInvalid?:(id:string)=>void):PlanData|null{
+ try{
+  const data=JSON.parse(p.data) as PlanData;
+  if(!isPayLaterProvider(data.provider)||!validDate(data.date)||!Number.isSafeInteger(data.total)||data.total>1e11)throw Error('Invalid plan details');
+  validateRows(data.rows,data.total,p.revision<0?Infinity:250);
+  if(data.months!==data.rows.length||data.first_due!==data.rows[0].due)throw Error('Invalid plan schedule');
+  if(data.covers!==undefined&&(!Array.isArray(data.covers)||data.covers.some(c=>!c||typeof c.plan!=='string'||typeof c.row!=='string'||!Number.isSafeInteger(c.amount)||c.amount<=0)))throw Error('Invalid invoice coverage');
+  return data;
+ }catch{onInvalid?.(p.id);return null;}
+}
+export function allCommitments(saved:Commitment[]=[],trip:TripEntryRow[]=[],onInvalid?:(id:string)=>void){
+ const imported=new Map<string,Commitment>();
+ for(const entry of trip){
+  try{const p=tripPlan(entry);if(p)imported.set(p.id,p);}
+  catch{onInvalid?.(`trip:${entry.group_id}:${entry.record_id}:${entry.member_id}`);}
+ }
+ const savedIds=new Set(saved.map(p=>p.id));
+ const result=[...saved.filter(p=>p.kind!=='paylater'||readPlan(p,onInvalid)).map(p=>{
+  const source=imported.get(p.id);
+  return {...p,review:p.source_key.startsWith('trip:')&&(!source||source.source_signature!==p.source_signature||source.currency!==p.currency||JSON.parse(source.data).date!==JSON.parse(p.data).date)};
+ }),...[...imported.values()].filter(p=>!savedIds.has(p.id))];
  for(const p of result.filter(p=>p.source_key.startsWith('invoice:'))){
   const d=JSON.parse(p.data) as PlanData,month=p.source_key.slice(-7);
   p.review=(d.covers||[]).some(c=>{
    const covered=result.find(x=>x.id===c.plan);
-   if(!covered||covered.status!=='active'||covered.review||covered.currency!==p.currency)return true;
+   if(!covered||covered.kind!=='paylater'||covered.status!=='active'||covered.review||covered.currency!==p.currency)return true;
    const plan=JSON.parse(covered.data) as PlanData,row=plan.rows.find(r=>r.id===c.row);
    return plan.provider!==d.provider||!row||row.amount!==c.amount||row.due.slice(0,7)!==month||!!row.paid_date;
   });
@@ -48,10 +72,11 @@ export type DueItem=DueSummaryRow&(
 );
 export function dueSummary(items:DueItem[]){return {total:items.filter(d=>!d.review&&!d.amountPending).reduce((n,d)=>n+d.amount,0),pending:items.filter(d=>d.amountPending).length,count:items.length};}
 export function dueDescription(items:DueItem[],now:string){const {count,pending}=dueSummary(items);return `${count} 笔待付${pending?`（其中 ${pending} 笔金额待填）`:''} · ${items.filter(d=>d.due<now).length} 笔逾期`;}
-export function paymentDue(plans:Commitment[],bills:PocketBill[],occurrences:Term[],rules:ScheduledRule[],now:string,end:string,schedule:(start:string,frequency:string,end:string,monthDays?:string)=>string[]):DueItem[]{
+export function paymentDue(plans:Commitment[],bills:PocketBill[],occurrences:Term[],rules:ScheduledRule[],now:string,end:string,schedule:(start:string,frequency:string,end:string,monthDays?:string)=>string[],onInvalid?:(id:string)=>void):DueItem[]{
  const result:DueItem[]=[],marks=new Map(plans.filter(p=>p.kind==='confirmation').map(p=>[p.id,{...JSON.parse(p.data),ignored:p.status==='ignored'}]));
- const covered=new Set(plans.filter(p=>p.kind==='paylater'&&p.status==='active').flatMap(p=>((JSON.parse(p.data) as PlanData).covers||[]).map(c=>JSON.stringify([c.plan,c.row]))));
- for(const p of plans.filter(p=>p.kind==='paylater'&&p.status==='active'))for(const row of (JSON.parse(p.data) as PlanData).rows)if(!row.paid_date&&!covered.has(JSON.stringify([p.id,row.id]))&&row.due<=end)result.push({id:row.id,title:p.title,due:row.due,amount:row.amount,currency:p.currency,type:'paylater',parent:p,row,review:p.review});
+ const active=plans.filter(p=>p.kind==='paylater'&&p.status==='active').flatMap(p=>{const data=readPlan(p,onInvalid);return data?[{p,data}]:[];});
+ const covered=new Set(active.flatMap(({data})=>(data.covers||[]).map(c=>JSON.stringify([c.plan,c.row]))));
+ for(const {p,data} of active)for(const row of data.rows)if(!row.paid_date&&!covered.has(JSON.stringify([p.id,row.id]))&&row.due<=end)result.push({id:row.id,title:p.title,due:row.due,amount:row.amount,currency:p.currency,type:'paylater',parent:p,row,review:p.review});
  for(const bill of bills)if(bill.status==='active'&&['planned','postpaid'].includes(bill.mode)&&!bill.paid_date&&(bill.due_date||bill.consumption_date)<=end)result.push({id:'pocket:'+bill.id,title:bill.title,due:bill.due_date||bill.consumption_date,amount:bill.amount,currency:bill.currency,type:'pocket',parent:bill,expected:bill.mode==='planned'});
  const recorded=new Set(occurrences.map(o=>o.rule_id+':'+o.due));
  for(const o of occurrences.filter(o=>o.status==='pending'&&o.kind==='expense'&&o.due<=end&&!marks.get(`rule:${o.rule_id}:${o.due}`)?.ignored)){

@@ -321,4 +321,47 @@ await test('an ordinary edit cannot race a new PayLater link',async()=>{
  assert.equal((await post({...body,action:'edit',title:'stale edit',edit_version:tx.edit_version})).status,409);
  assert.deepEqual((await get()).transactions,[tx]);
 });
+await test('Rule edit spanning 23:59 to 00:00 KL keeps both periods under the right rule',async()=>{
+ const before=domain.today(new Date('2026-10-25T15:59:59Z'));
+ const after=domain.today(new Date('2026-10-25T16:00:00Z'));
+ // Inject the two business days independently so the route regression also runs against the old date helper.
+ identity='kl-midnight-owner';clock='2026-10-24';
+ const rule={...base,action:'rule',id:'midnight-rule-01',date:'2026-10-25',frequency:'weekly',mode:'fixed'};
+ assert.equal((await post(rule)).status,200);
+ clock='2026-10-25';beforeBatch=()=>{clock='2026-10-26';};
+ const edit={...rule,action:'rule_edit',revision:0,title:'新金额',amount:'20',date:'2026-10-26'};
+ assert.equal((await post(edit)).status,200);
+ assert.equal((await get()).rules[0].processed_through,'2026-10-25');
+ assert.equal((await post({action:'sync'})).status,200);
+ assert.deepEqual((await get()).occurrences.map(o=>[o.due,o.amount]),[['2026-10-26',2000],['2026-10-25',1229]]);
+ identity='kl-at-midnight-owner';clock='2026-10-25';
+ assert.equal((await post({...rule,id:'midnight-rule-02',date:'2026-10-26'})).status,200);
+ clock='2026-10-26';
+ assert.equal((await post({...edit,id:'midnight-rule-02',date:'2026-10-27'})).status,200);
+ assert.deepEqual((await get()).occurrences.map(o=>[o.due,o.amount]),[['2026-10-26',1229]]);
+ assert.equal(before,'2026-10-25');assert.equal(after,'2026-10-26');
+});
+await test('Ledger delivers all old unresolved occurrences and caps only resolved history',async()=>{
+ identity='occurrence-cap-owner';
+ sql.prepare(`WITH RECURSIVE seq(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM seq WHERE n<5002)
+  INSERT INTO occurrences(id,owner,rule_id,due,status,title,amount,currency,kind,category)
+  SELECT 'history-'||n,?,'history-'||n,'2026-01-01','recorded','Settled',100,'MYR','income','工资' FROM seq`).run(identity);
+ const insert=sql.prepare("INSERT INTO occurrences(id,owner,rule_id,due,status,title,amount,currency,kind,category) VALUES (?,?,?,'2000-01-01',?,'Old',100,'MYR',?,'其他')");
+ for(const [id,status,kind] of [['pending-old','pending','expense'],['awaiting-old','awaiting','income'],['unpaid-old','unpaid','expense'],['legacy-old','recorded','expense'],['changed-amount','awaiting','expense'],['paid-old','awaiting','expense']])insert.run(id,identity,id,status,kind);
+ const mark=sql.prepare("INSERT INTO pocket_commitments(owner,id,kind,title,currency,data) VALUES (?,?,'confirmation','Paid','MYR',?)");
+ mark.run(identity,'rule:paid-old:2000-01-01',JSON.stringify({paid_date:'2000-01-02',amount:100}));
+ mark.run(identity,'rule:changed-amount:2000-01-01',JSON.stringify({paid_date:'2000-01-02',amount:80}));
+ const data=await get();
+ assert.equal(data.status,200);
+ assert.deepEqual(data.occurrences.filter(o=>o.due==='2000-01-01').map(o=>o.id).sort(),['awaiting-old','changed-amount','legacy-old','pending-old','unpaid-old']);
+ assert.equal(data.occurrences.length,5005);assert.equal(data.truncated,true);
+ assert.deepEqual(data.pending.map(o=>o.id),['pending-old']);
+ sql.prepare("DELETE FROM occurrences WHERE owner=? AND due>'2000-01-01'").run(identity);
+ sql.prepare(`WITH RECURSIVE seq(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM seq WHERE n<5002)
+  INSERT INTO occurrences(id,owner,rule_id,due,status,title,amount,currency,kind,category)
+  SELECT 'open-'||n,?,'open-'||n,'2026-01-01','awaiting','Unpaid',100,'MYR','expense','其他' FROM seq`).run(identity);
+ const open=await get();
+ assert.equal(open.occurrences.length,5008);
+ assert.equal(open.truncated,false);
+});
 sql.close();

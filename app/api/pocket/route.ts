@@ -6,7 +6,49 @@ export const dynamic='force-dynamic';
 const reply=(data:unknown,status=200)=>Response.json(data,{status,headers:{'Cache-Control':'private, no-store'}});
 function database(){if(!env.DB)throw Error('Database unavailable');return env.DB;}
 const tables={commitments:'pocket_commitments',bills:'pocket_bills',accounts:'pocket_accounts',templates:'pocket_templates',goals:'pocket_goals',categories:'pocket_categories',range_budgets:'range_budgets'} as const;
-export async function GET(){try{const u=await getChatGPTUser();if(!u)return reply({error:'请先登录'},401);const pairs=await Promise.all(Object.entries(tables).map(async([key,table])=>{const r=await database().prepare(`SELECT * FROM ${table} WHERE owner=? LIMIT 2001`).bind(u.userId).all();return [key,r.results]}));if(pairs.some(([,rows])=>(rows as unknown[]).length>2000))return reply({error:'记录过多，请先导出并整理账单'},413);return reply(Object.fromEntries(pairs));}catch(e){console.error('pocket.read',e);return reply({error:'暂时无法读取生活账单'},503);}}
+const readLimit=2000;
+const requiredRows:Partial<Record<keyof typeof tables,string>>={
+ // Confirmation rows also carry payment and ignore state for the ledger's recurring rules.
+ commitments:`kind='confirmation' OR (status='active' AND (kind='deposit' OR
+  (kind='paylater' AND (source_key GLOB 'invoice:*' OR CASE WHEN json_valid(data) THEN
+   COALESCE(json_array_length(data,'$.rows'),0)=0 OR EXISTS (
+    SELECT 1 FROM json_each(data,'$.rows') r WHERE CASE WHEN r.type='object'
+     THEN COALESCE(json_extract(r.value,'$.paid_date'),'')='' ELSE 1 END
+   ) ELSE 1 END))))`,
+ bills:"status='active' AND (mode IN ('wallet','use') OR (mode IN ('planned','postpaid') AND paid_date=''))",
+ accounts:"EXISTS (SELECT 1 FROM pocket_bills b WHERE b.owner=t.owner AND b.account_id=t.id AND b.status='active')",
+};
+const historyOrder:Partial<Record<keyof typeof tables,string>>={
+ bills:'consumption_date DESC,created_at DESC,id DESC',
+ commitments:"CASE WHEN json_valid(data) THEN json_extract(data,'$.date') END DESC,id DESC",
+ range_budgets:'end DESC,id DESC',
+};
+export async function GET(){try{
+ const u=await getChatGPTUser();if(!u)return reply({error:'请先登录'},401);
+ const db=database();
+ const results=await Promise.all(Object.entries(tables).map(async([name,table])=>{
+  const key=name as keyof typeof tables,order=historyOrder[key]??(key==='categories'?'name':'id');
+  const required=requiredRows[key];
+  if(!required){
+   const {results:rows}=await db.prepare(`SELECT * FROM ${table} WHERE owner=? ORDER BY ${order} LIMIT ?`).bind(u.userId,readLimit+1).all();
+   return {key,rows:rows.slice(0,readLimit),truncated:rows.length>readLimit};
+  }
+  const {results:ranked}=await db.prepare(`WITH classified AS (
+   SELECT t.*,CASE WHEN ${required} THEN 1 ELSE 0 END AS required FROM ${table} t WHERE owner=?
+  ), ranked AS (
+   SELECT *,ROW_NUMBER() OVER (PARTITION BY required ORDER BY ${order}) AS position FROM classified
+  ) SELECT * FROM ranked WHERE required=1 OR position<=? ORDER BY ${order}`)
+   .bind(u.userId,readLimit+1).all<Record<string,unknown>&{required:number;position:number}>();
+  const rows=[];
+  let truncated=false;
+  for(const {required,position,...row} of ranked){
+   if(!required&&position>readLimit)truncated=true;
+   else rows.push(row);
+  }
+  return {key,rows,truncated};
+ }));
+ return reply({...Object.fromEntries(results.map(({key,rows})=>[key,rows])),truncated:results.some(r=>r.truncated)});
+ }catch(e){console.error('pocket.read',e);return reply({error:'暂时无法读取生活账单'},503);}}
 export async function POST(req:Request){try{
  const u=await getChatGPTUser();if(!u)return reply({error:'请先登录'},401);const owner=u.userId,db=database();
  if(req.headers.get('origin')!==new URL(req.url).origin)return reply({error:'请求来源无效'},403);
