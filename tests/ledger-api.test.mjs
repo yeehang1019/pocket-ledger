@@ -226,7 +226,7 @@ await test('null, array and primitive payloads fail validation rather than masqu
 });
 await test('prepaid recurring expense can be corrected without changing its original future due date',async()=>{
  identity='future-expense-editor';clock='2026-11-11';
- sql.prepare("INSERT INTO transactions(id,owner,title,amount,currency,kind,category,date,note,rule_id,occurrence,created_at) VALUES ('future-edit-001',?,'房租',60000,'MYR','expense','居住','2026-11-20','周期付款确认','future-rule','2026-11-20','now')").run(identity);
+ sql.prepare("INSERT INTO transactions(id,owner,title,amount,currency,kind,category,date,note,rule_id,occurrence,created_at) VALUES ('future-edit-001',?,'房租',60000,'MYR','expense','居住','2026-11-20','周期自动入账','future-rule','2026-11-20','now')").run(identity);
  const original=(await get()).transactions[0],edit={...base,id:original.id,action:'edit',title:'房租备注修正',category:'居住',amount:'600',date:'2026-11-20',edit_version:original.edit_version};
  assert.equal((await post({...edit,date:'2026-11-21'})).status,400);
  assert.equal((await post(edit)).status,200);
@@ -248,18 +248,77 @@ await test('recurring rule replay verifies full content and never claims another
  assert.equal((await get()).rules[0].amount,1229);
  identity='rule-other-owner';assert.equal((await post(rule)).status,409);assert.equal((await get()).rules.length,0);
 });
-await test('PayLater deletion requires a choice and preserves or cancels only the linked plan',async()=>{
+async function linkedPlanDeletion(id,paidDate=''){
  identity='delete-plan-owner';clock='2026-10-23';
- for(const [choice,id] of [['keep','keep-plan-record'],['cancel','cancel-plan-record']]){
-  assert.equal((await post({...base,id,date:clock})).status,200);
-  const data={rows:[{paid_date:'',amount:1229}]};
-  sql.prepare("INSERT INTO pocket_commitments(owner,id,kind,title,currency,data,status,revision) VALUES (?,?,'paylater','plan','MYR',?,'active',0)").run(identity,id,JSON.stringify(data));
-  const row=(await get()).transactions.find(t=>t.id===id);
-  const body={action:'delete',id,edit_version:row.edit_version,plan_revision:0};
-  assert.equal((await post(body)).status,400);
-  assert.equal((await post({...body,plan_disposition:choice})).status,200);
-  assert.equal((await get()).transactions.some(t=>t.id===id),false);
-  assert.equal(sql.prepare('SELECT status FROM pocket_commitments WHERE owner=? AND id=?').get(identity,id).status,choice==='keep'?'active':'cancelled');
- }
+ assert.equal((await post({...base,id,date:clock})).status,200);
+ const data={rows:[{id:`${id}:1`,paid_date:paidDate,amount:1229}]};
+ sql.prepare("INSERT INTO pocket_commitments(owner,id,kind,title,currency,data,status,revision) VALUES (?,?,'paylater','plan','MYR',?,'active',0)").run(identity,id,JSON.stringify(data));
+ const row=(await get()).transactions.find(t=>t.id===id);
+ return {action:'delete',id,edit_version:row.edit_version,plan_revision:0};
+}
+const readPlan=id=>sql.prepare('SELECT * FROM pocket_commitments WHERE owner=? AND id=?').get(identity,id);
+const readDeleted=id=>sql.prepare('SELECT deleted FROM transactions WHERE owner=? AND id=?').get(identity,id).deleted;
+await test('PayLater delete requires a disposition and keep deletes an uncovered expense while preserving its plan',async()=>{
+ const body=await linkedPlanDeletion('keep-plan-record'),plan=readPlan(body.id);
+ assert.equal((await post(body)).status,400);
+ assert.equal((await post({...base,action:'edit',id:body.id,date:clock,edit_version:body.edit_version})).status,409);
+ assert.equal((await post({...body,plan_disposition:'keep'})).status,200);
+ assert.equal(readDeleted(body.id),1);
+ assert.deepEqual(readPlan(body.id),plan);
+});
+await test('PayLater cancel deletes the expense and cancels the plan atomically',async()=>{
+ const body={...await linkedPlanDeletion('cancel-plan-record'),plan_disposition:'cancel'},plan=readPlan(body.id);
+ failAfter=2;
+ assert.equal((await post(body)).status,503);
+ assert.equal(readDeleted(body.id),0);
+ assert.deepEqual(readPlan(body.id),plan);
+ assert.equal((await post(body)).status,200);
+ assert.equal(readDeleted(body.id),1);
+ assert.equal(readPlan(body.id).status,'cancelled');
+ assert.equal(readPlan(body.id).revision,plan.revision+1);
+});
+for(const choice of ['keep','cancel']){
+ await test(`PayLater ${choice} refuses active invoice coverage, including coverage added before the batch`,async()=>{
+  const body={...await linkedPlanDeletion(`covered-plan-${choice}`),plan_disposition:choice},plan=readPlan(body.id);
+  const invoiceData=JSON.stringify({covers:[{plan:body.id,row:`${body.id}:1`,amount:1229}]});
+  beforeBatch=()=>sql.prepare("INSERT INTO pocket_commitments(owner,id,kind,title,currency,source_key,data,status) VALUES (?,?,'paylater','Invoice','MYR',?,?,'active')").run(identity,`invoice-${choice}`,`invoice:${choice}`,invoiceData);
+  assert.equal((await post(body)).status,409);
+  assert.equal((await post(body)).status,409);
+  assert.equal(readDeleted(body.id),0);
+  assert.deepEqual(readPlan(body.id),plan);
+ });
+ await test(`PayLater ${choice} refuses a plan with paid rows`,async()=>{
+  const body={...await linkedPlanDeletion(`paid-plan-${choice}`,'2026-10-22'),plan_disposition:choice},plan=readPlan(body.id);
+  assert.equal((await post(body)).status,409);
+  assert.equal(readDeleted(body.id),0);
+  assert.deepEqual(readPlan(body.id),plan);
+ });
+ await test(`PayLater ${choice} refuses a stale revision both before and during the batch`,async()=>{
+  const body={...await linkedPlanDeletion(`stale-plan-${choice}`),plan_disposition:choice},plan=readPlan(body.id);
+  assert.equal((await post({...body,plan_revision:plan.revision+1})).status,409);
+  beforeBatch=()=>sql.prepare('UPDATE pocket_commitments SET revision=revision+1 WHERE owner=? AND id=?').run(identity,body.id);
+  assert.equal((await post(body)).status,409);
+  assert.equal(readDeleted(body.id),0);
+  assert.deepEqual({...readPlan(body.id)},{...plan,revision:plan.revision+1});
+ });
+}
+for(const [id,note] of [['managed-rule-expense','周期付款确认'],['deposit:managed-deposit:rent-movement','押金抵租']]){
+ await test('generic ledger edit and delete reject '+id,async()=>{
+  identity='managed-ledger-owner';clock='2026-10-23';
+  sql.prepare("INSERT INTO transactions(id,owner,title,amount,currency,kind,category,date,note,created_at) VALUES (?,?,'Managed',1200,'MYR','expense','居住',?,?,'now')").run(id,identity,clock,note);
+  const tx=(await get()).transactions.find(t=>t.id===id);
+  assert.equal((await post({...base,action:'edit',id,date:clock,edit_version:tx.edit_version})).status,409);
+  assert.equal((await post({action:'delete',id,edit_version:tx.edit_version})).status,409);
+  assert.deepEqual((await get()).transactions.find(t=>t.id===id),tx);
+ });
+}
+await test('an ordinary edit cannot race a new PayLater link',async()=>{
+ identity='ledger-link-race-owner';clock='2026-10-23';
+ const body={...base,id:'ledger-link-race',date:clock};
+ assert.equal((await post(body)).status,200);
+ const [tx]=(await get()).transactions;
+ beforeBatch=()=>sql.prepare("INSERT INTO pocket_commitments(owner,id,kind,title,currency,data) VALUES (?,?,'paylater','Plan','MYR','{}')").run(identity,tx.id);
+ assert.equal((await post({...body,action:'edit',title:'stale edit',edit_version:tx.edit_version})).status,409);
+ assert.deepEqual((await get()).transactions,[tx]);
 });
 sql.close();

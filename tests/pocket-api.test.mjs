@@ -4,7 +4,8 @@ import {DatabaseSync} from 'node:sqlite';
 import ts from 'typescript';
 import {readFileSync,readdirSync} from 'node:fs';
 const sql=new DatabaseSync(':memory:');for(const f of readdirSync('drizzle').filter(f=>f.endsWith('.sql')).sort())sql.exec(readFileSync('drizzle/'+f,'utf8'));
-const wrap=(q,p=[])=>({bind:(...args)=>wrap(q,args),first:async()=>sql.prepare(q).get(...p)||null,all:async()=>({results:sql.prepare(q).all(...p)}),run:async()=>{const r=sql.prepare(q).run(...p);return {meta:{changes:r.changes}}}});
+let beforeWrite;
+const wrap=(q,p=[])=>({bind:(...args)=>wrap(q,args),first:async()=>sql.prepare(q).get(...p)||null,all:async()=>({results:sql.prepare(q).all(...p)}),run:async()=>{if(beforeWrite){const hook=beforeWrite;beforeWrite=null;hook();}const r=sql.prepare(q).run(...p);return {meta:{changes:r.changes}}}});
 const DB={prepare:q=>wrap(q)};
 const transpile=s=>ts.transpileModule(s,{compilerOptions:{module:ts.ModuleKind.ESNext,target:ts.ScriptTarget.ES2022}}).outputText;
 const domain=await import('data:text/javascript;base64,'+Buffer.from(transpile(readFileSync('lib/ledger-domain.ts','utf8'))).toString('base64'));
@@ -48,5 +49,43 @@ await test('categories, templates, goals and range budgets stay owner scoped',as
  assert.equal((await post({action:'range_budget',id:'budget-trip-002',title:'Wrong date',currency:'MYR',category:'all',amount:'200',start:'2026-10-10',end:'2026-10-09'})).status,400);
  user='owner-b';const data=await get();assert.equal(data.templates.length,0);assert.equal(data.goals.length,0);assert.equal(data.categories.length,0);assert.equal(data.range_budgets.length,0);
  user='owner-a';assert.equal((await get()).goals[0].saved,20000);
+});
+await test('bill IDs replay only identical active content, including prepaid usage',async()=>{
+ user='bill-replay-owner';
+ assert.equal((await post(bill)).status,200);
+ assert.equal((await post({...bill,amount:'100.00'})).status,200);
+ assert.equal((await post({...bill,title:'另一次充值'})).status,409);
+ const use={...bill,id:'bill-replay-use',mode:'use',parent_id:bill.id,paid_date:''};
+ assert.equal((await post(use)).status,200);
+ assert.equal((await post(use)).status,200); // The balance is now zero.
+ assert.equal((await post({...use,amount:'20'})).status,409);
+ assert.equal((await post({action:'remove',entity:'bills',id:use.id})).status,200);
+ assert.equal((await post(use)).status,409);
+});
+for(const action of ['settle','unsettle','activate']){
+ await test('bill '+action+' rejects a lost transition and a repeat',async()=>{
+  user='bill-transition-owner';
+  const body={...bill,id:'bill-transition-'+action,mode:action==='activate'?'planned':'postpaid',paid_date:action==='unsettle'?bill.paid_date:''};
+  assert.equal((await post(body)).status,200);
+  const request={action,id:body.id,date:bill.paid_date};
+  beforeWrite=()=>sql.prepare("UPDATE pocket_bills SET status='cancelled' WHERE owner=? AND id=?").run(user,body.id);
+  assert.equal((await post(request)).status,409);
+  assert.equal(sql.prepare('SELECT paid_date FROM pocket_bills WHERE owner=? AND id=?').get(user,body.id).paid_date,body.paid_date);
+  sql.prepare("UPDATE pocket_bills SET status='active' WHERE owner=? AND id=?").run(user,body.id);
+  assert.equal((await post(request)).status,200);
+  assert.equal((await post(request)).status,409);
+ });
+}
+await test('a card deleted before INSERT cannot leave an orphaned bill',async()=>{
+ user='bill-card-race-owner';
+ const card={action:'account',id:'bill-race-card',title:'Card',currency:'MYR',statement_day:25,due_day:15};
+ const linked={...bill,id:'bill-card-race',mode:'postpaid',paid_date:'',account_id:card.id};
+ assert.equal((await post(card)).status,200);
+ beforeWrite=()=>sql.prepare('DELETE FROM pocket_accounts WHERE owner=? AND id=?').run(user,card.id);
+ assert.equal((await post(linked)).status,400);
+ assert.equal((await get()).bills.length,0);
+ assert.equal((await post({...card,currency:'SGD'})).status,200);
+ assert.equal((await post(linked)).status,400);
+ assert.equal((await get()).bills.length,0);
 });
 sql.close();

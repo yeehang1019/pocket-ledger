@@ -7,6 +7,14 @@ import {CURRENCIES,CATEGORIES,INCOME_CATEGORIES,minor,today,validDate,dates} fro
 export const dynamic='force-dynamic';
 const response=(data:unknown,status=200)=>Response.json(data,{status,headers:{'Cache-Control':'private, no-store'}});
 function db(){if(!env.DB)throw new Error('Database unavailable');return env.DB;}
+const editableLedgerTransaction="note<>'周期付款确认' AND id NOT GLOB 'deposit:*'";
+const noLinkedPlan="NOT EXISTS (SELECT 1 FROM pocket_commitments p WHERE p.owner=transactions.owner AND p.id=transactions.id AND p.kind='paylater')";
+const noInvoiceCoverage=`NOT EXISTS (SELECT 1 FROM pocket_commitments p, json_each(p.data,'$.covers') c
+  WHERE p.owner=transactions.owner AND p.kind='paylater' AND p.status='active' AND p.source_key GLOB 'invoice:*'
+  AND json_extract(c.value,'$.plan')=transactions.id)`;
+const ledgerSnapshot='id=? AND owner=? AND deleted=0 AND title=? AND amount=? AND currency=? AND kind=? AND category=? AND date=? AND note=? AND '+editableLedgerTransaction+' AND '+noInvoiceCoverage;
+const unmanagedSnapshot=ledgerSnapshot+' AND '+noLinkedPlan;
+const noPaidRows=`NOT EXISTS (SELECT 1 FROM json_each(p.data,'$.rows') r WHERE COALESCE(json_extract(r.value,'$.paid_date'),'')<>'')`;
 async function auth(){const user=await getChatGPTUser();return user?.userId;}
 async function reconcile(owner:string,ruleId?:string){
  const database=db(),now=today(); const rows=await database.prepare("SELECT * FROM rules WHERE owner=? AND status='active'").bind(owner).all<RuleRow>();
@@ -54,22 +62,35 @@ export async function POST(req:Request){try{
  if(b.action==='delete'){
  const tx=await database.prepare('SELECT * FROM transactions WHERE id=? AND owner=?').bind(String(b.id),owner).first<TransactionRow>();
  if(!tx)return response({error:'记录不存在'},404);
+ if(tx.note==='周期付款确认'||tx.id.startsWith('deposit:'))return response({error:'此交易由账单管理'},409);
  const plan=await database.prepare("SELECT * FROM pocket_commitments WHERE owner=? AND id=? AND kind='paylater'").bind(owner,tx.id).first<Commitment>();
  if(plan&&!['keep','cancel'].includes(b.plan_disposition))return response({error:'请选择如何处理还款计划'},400);
- if(tx.deleted)return plan&&b.plan_disposition==='cancel'&&plan.status!=='cancelled'?response({error:'消费已删除，计划仍保留，请到账单页核对'},409):response({ok:true});
+ if(tx.deleted){
+  const replayGuard=plan?noInvoiceCoverage:noInvoiceCoverage+' AND '+noLinkedPlan;
+  if(!await database.prepare('SELECT 1 FROM transactions WHERE id=? AND owner=? AND deleted=1 AND '+editableLedgerTransaction+' AND '+replayGuard).bind(tx.id,owner).first())return response({error:'此交易由账单管理'},409);
+  return plan&&b.plan_disposition==='cancel'&&plan.status!=='cancelled'?response({error:'消费已删除，计划仍保留，请到账单页核对'},409):response({ok:true});
+ }
  if(plan&&b.plan_revision!==plan.revision)return response({error:'还款计划已变更，请重新载入'},409);
- const cancel=plan&&b.plan_disposition==='cancel';
- if(cancel&&(JSON.parse(plan.data) as PlanData).rows.some(r=>r.paid_date))return response({error:'已有付款记录，请到账单 → PayLater 核对付款历史'},409);
+ if(plan&&(JSON.parse(plan.data) as PlanData).rows.some(r=>r.paid_date))return response({error:'已有付款记录，请到账单 → PayLater 核对付款历史'},409);
  if(b.edit_version!==transactionVersion(tx))return response({error:'这笔记录已在其他设备修改，请重新载入后再删除'},409);
- const guard="id=? AND owner=? AND deleted=0 AND title=? AND amount=? AND currency=? AND kind=? AND category=? AND date=? AND note=?";
  const values=[tx.id,owner,tx.title,tx.amount,tx.currency,tx.kind,tx.category,tx.date,tx.note||''];
  const stmts=[];
- if(tx.rule_id)stmts.push(database.prepare("UPDATE occurrences SET status='skipped' WHERE rule_id=? AND due=? AND owner=? AND EXISTS (SELECT 1 FROM transactions WHERE "+guard+")").bind(tx.rule_id,tx.occurrence,owner,...values));
- const mutation=crypto.randomUUID();
- if(cancel)stmts.push(database.prepare("UPDATE pocket_commitments SET status='cancelled',revision=revision+1,mutation=? WHERE owner=? AND id=? AND revision=? AND EXISTS (SELECT 1 FROM transactions WHERE "+guard+") AND NOT EXISTS (SELECT 1 FROM pocket_commitments p,json_each(p.data,'$.covers') c WHERE p.owner=? AND p.kind='paylater' AND p.status='active' AND p.id<>? AND json_extract(c.value,'$.plan')=?)").bind(mutation,owner,tx.id,plan.revision,...values,owner,tx.id,tx.id));
- const planGuard=cancel?'EXISTS (SELECT 1 FROM pocket_commitments WHERE owner=? AND id=? AND mutation=?)':plan?"EXISTS (SELECT 1 FROM pocket_commitments WHERE owner=? AND id=? AND kind='paylater' AND revision=?)":"NOT EXISTS (SELECT 1 FROM pocket_commitments WHERE owner=? AND id=? AND kind='paylater')";
- stmts.push(database.prepare('UPDATE transactions SET deleted=1 WHERE '+guard+' AND '+planGuard).bind(...values,owner,tx.id,...(cancel?[mutation]:plan?[plan.revision]:[])));
- const result=await database.batch(stmts);return result[result.length-1].meta.changes?response({ok:true}):response({error:cancel?'记录已变更或计划已归入平台月账单。请重新载入并到账单 → PayLater 核对':'这笔记录已在其他设备修改，请重新载入后再删除'},409);
+ let deleteGuard=unmanagedSnapshot,planValues:unknown[]=[];
+ if(plan){
+  const linkedPlan="SELECT 1 FROM pocket_commitments p WHERE p.owner=transactions.owner AND p.id=transactions.id AND p.kind='paylater'";
+  if(b.plan_disposition==='cancel'){
+   const mutation=crypto.randomUUID();
+   stmts.push(database.prepare("UPDATE pocket_commitments AS p SET status='cancelled',revision=revision+1,mutation=? WHERE owner=? AND id=? AND kind='paylater' AND revision=? AND "+noPaidRows+" AND EXISTS (SELECT 1 FROM transactions WHERE "+ledgerSnapshot+")").bind(mutation,owner,tx.id,plan.revision,...values));
+   deleteGuard=ledgerSnapshot+" AND EXISTS ("+linkedPlan+" AND p.mutation=?)";
+   planValues=[mutation];
+  }else{
+   deleteGuard=ledgerSnapshot+" AND EXISTS ("+linkedPlan+" AND p.revision=? AND "+noPaidRows+")";
+   planValues=[plan.revision];
+  }
+ }
+ if(tx.rule_id)stmts.push(database.prepare("UPDATE occurrences SET status='skipped' WHERE rule_id=? AND due=? AND owner=? AND EXISTS (SELECT 1 FROM transactions WHERE "+deleteGuard+")").bind(tx.rule_id,tx.occurrence,owner,...values,...planValues));
+ stmts.push(database.prepare('UPDATE transactions SET deleted=1 WHERE '+deleteGuard).bind(...values,...planValues));
+ const result=await database.batch(stmts);return result[result.length-1].meta.changes?response({ok:true}):response({error:plan?'记录已变更或计划已归入平台月账单，请重新载入并到账单 → PayLater 核对':'记录已变更或由账单管理，请重新载入后核对'},409);
  }
  if(b.action==='status'){
  if(!['active','paused','ended'].includes(b.status))return response({error:'无效状态'},400);
@@ -134,17 +155,15 @@ export async function POST(req:Request){try{
  if(b.action!=='edit'&&b.date>today())return response({error:'实际交易不能使用未来日期，请创建周期账单'},400);
  const note=String(b.note||'');if(note.length>500)return response({error:'备注最多 500 字'},400);
  if(b.action==='edit'){
- if(await database.prepare("SELECT 1 FROM pocket_commitments WHERE owner=? AND id=? AND kind='paylater'").bind(owner,id).first())return response({error:'请使用 PayLater 关联表单编辑这笔消费'},409);
  const existing=await database.prepare('SELECT * FROM transactions WHERE id=? AND owner=? AND deleted=0').bind(id,owner).first<TransactionRow>();
  if(!existing)return response({error:'记录不存在'},404);
  if(b.date>today()&&!(existing.rule_id&&existing.kind==='expense'&&b.kind==='expense'&&b.date===existing.date))return response({error:'不能把实际交易改成未来日期'},400);
  if(b.edit_version!==transactionVersion(existing))return response({error:'这笔记录已在其他设备修改',current_version:transactionVersion(existing)},409);
- const guard="id=? AND owner=? AND deleted=0 AND title=? AND amount=? AND currency=? AND kind=? AND category=? AND date=? AND note=?";
  const guardValues=[id,owner,existing.title,existing.amount,existing.currency,existing.kind,existing.category,existing.date,existing.note||''];
  const results=await database.batch([
- database.prepare("UPDATE occurrences SET title=?,amount=?,currency=?,kind=?,category=? WHERE id=? AND owner=? AND status IN ('recorded','awaiting') AND EXISTS (SELECT 1 FROM transactions WHERE "+guard+")").bind(b.title.trim(),amount,b.currency,b.kind,b.category,id,owner,...guardValues),
- database.prepare('UPDATE transactions SET title=?,amount=?,currency=?,kind=?,category=?,date=?,note=? WHERE '+guard).bind(b.title.trim(),amount,b.currency,b.kind,b.category,b.date,note,...guardValues)]);
- if(!results[1].meta.changes)return response({error:'这笔记录已在其他设备修改'},409);
+ database.prepare("UPDATE occurrences SET title=?,amount=?,currency=?,kind=?,category=? WHERE id=? AND owner=? AND status IN ('recorded','awaiting') AND EXISTS (SELECT 1 FROM transactions WHERE "+unmanagedSnapshot+")").bind(b.title.trim(),amount,b.currency,b.kind,b.category,id,owner,...guardValues),
+ database.prepare('UPDATE transactions SET title=?,amount=?,currency=?,kind=?,category=?,date=?,note=? WHERE '+unmanagedSnapshot).bind(b.title.trim(),amount,b.currency,b.kind,b.category,b.date,note,...guardValues)]);
+ if(!results[1].meta.changes)return response({error:'记录已变更或由账单管理，请重新载入后核对'},409);
  }else{
   await database.prepare('INSERT OR IGNORE INTO transactions (id,owner,title,amount,currency,kind,category,date,note,deleted,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)').bind(id,owner,b.title.trim(),amount,b.currency,b.kind,b.category,b.date,note,0,new Date().toISOString()).run();
   const saved=await database.prepare('SELECT * FROM transactions WHERE id=? AND owner=?').bind(id,owner).first<TransactionRow>();

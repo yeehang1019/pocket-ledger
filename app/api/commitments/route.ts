@@ -3,7 +3,7 @@ import {env} from 'cloudflare:workers';
 import {getChatGPTUser} from '@/app/chatgpt-auth';
 import {CURRENCIES,CATEGORIES,INCOME_CATEGORIES,minor,today,validDate,dates} from '@/lib/ledger-domain';
 import {transactionVersion} from '@/lib/transaction-version';
-import {paymentMethods,planRows,validateRows,tripPlan,depositHeld,allCommitments,type Commitment,type PlanData,type DepositData,type Instalment} from '@/lib/commitments';
+import {paymentMethods,planRows,validateRows,invoiceRowsMatchMonth,tripPlan,depositHeld,allCommitments,type Commitment,type PlanData,type DepositData,type Instalment} from '@/lib/commitments';
 export const dynamic='force-dynamic';
 class Conflict extends Error {}
 const reply=(body:unknown,status=200)=>Response.json(body,{status,headers:{'Cache-Control':'private, no-store'}});
@@ -16,8 +16,36 @@ export async function POST(req:Request){try{
  const source=b.id.startsWith('trip:')?await db.prepare("SELECT * FROM trip_entries WHERE owner=? AND 'trip:'||group_id||':'||record_id||':'||member_id=? AND record_type='expense'").bind(owner,b.id).first<TripEntryRow>():null;
  const imported=source?tripPlan(source):null,current=saved||imported;
  const revision=saved?.revision??-1,mutation=crypto.randomUUID();
- const write=(p:Commitment)=>saved?db.prepare('UPDATE pocket_commitments SET title=?,currency=?,source_key=?,source_signature=?,data=?,status=?,revision=revision+1,mutation=? WHERE owner=? AND id=? AND revision=?').bind(p.title,p.currency,p.source_key,p.source_signature,p.data,p.status,mutation,owner,b.id,revision):db.prepare('INSERT OR IGNORE INTO pocket_commitments(owner,id,kind,title,currency,source_key,source_signature,data,revision,status,mutation) VALUES (?,?,?,?,?,?,?,?,0,?,?)').bind(owner,b.id,p.kind,p.title,p.currency,p.source_key,p.source_signature,p.data,p.status,mutation);
+ const write=(p:Commitment,guard='1',values:unknown[]=[])=>saved
+  ?db.prepare('UPDATE pocket_commitments SET title=?,currency=?,source_key=?,source_signature=?,data=?,status=?,revision=revision+1,mutation=? WHERE owner=? AND id=? AND revision=? AND '+guard).bind(p.title,p.currency,p.source_key,p.source_signature,p.data,p.status,mutation,owner,b.id,revision,...values)
+  :db.prepare('INSERT INTO pocket_commitments(owner,id,kind,title,currency,source_key,source_signature,data,revision,status,mutation) SELECT ?,?,?,?,?,?,?,?,0,?,? WHERE '+guard+' ON CONFLICT(owner,id) DO NOTHING').bind(owner,b.id,p.kind,p.title,p.currency,p.source_key,p.source_signature,p.data,p.status,mutation,...values);
  const guarded=(sql:string,params:unknown[])=>db.prepare(sql+" WHERE EXISTS (SELECT 1 FROM pocket_commitments WHERE owner=? AND id=? AND mutation=?)").bind(...params,owner,b.id,mutation);
+ // Force a NOT NULL constraint error to roll back the batch if a linked write was skipped.
+ const requireLinkedWrite=()=>db.prepare('UPDATE pocket_commitments SET mutation=NULL WHERE owner=? AND id=? AND mutation=? AND changes()<>1').bind(owner,b.id,mutation);
+ const notCovered=`NOT EXISTS (SELECT 1 FROM pocket_commitments p, json_each(p.data,'$.covers') c
+  WHERE p.owner=? AND p.kind='paylater' AND p.status='active' AND p.source_key GLOB 'invoice:*'
+  AND json_extract(c.value,'$.plan')=?)`;
+ const writePlan=(p:Commitment)=>write(p,notCovered,[owner,b.id]);
+ const writeInvoice=(p:Commitment,plans:Commitment[])=>{
+  const coveredIds=new Set((JSON.parse(p.data) as PlanData).covers?.map(c=>c.plan));
+  const sources=plans.filter(plan=>coveredIds.has(plan.id)).map(plan=>({
+   id:plan.id,revision:plan.revision,currency:plan.currency,signature:plan.source_signature,date:(JSON.parse(plan.data) as PlanData).date,
+  }));
+  return write(p,`NOT EXISTS (
+   SELECT 1 FROM pocket_commitments i, json_each(i.data,'$.covers') c, json_each(?,'$.covers') wanted
+   WHERE i.owner=? AND i.id<>? AND i.kind='paylater' AND i.status='active' AND i.source_key GLOB 'invoice:*'
+   AND json_extract(c.value,'$.plan')=json_extract(wanted.value,'$.plan')
+   AND json_extract(c.value,'$.row')=json_extract(wanted.value,'$.row')
+  ) AND NOT EXISTS (
+   SELECT 1 FROM json_each(?) s
+   WHERE COALESCE((SELECT revision FROM pocket_commitments p WHERE p.owner=? AND p.id=json_extract(s.value,'$.id')), -1)<>json_extract(s.value,'$.revision')
+   OR (json_extract(s.value,'$.id') GLOB 'trip:*' AND NOT EXISTS (
+    SELECT 1 FROM trip_entries t WHERE t.owner=? AND t.record_type='expense' AND t.deleted=0
+    AND 'trip:'||t.group_id||':'||t.record_id||':'||t.member_id=json_extract(s.value,'$.id')
+    AND t.paylater=json_extract(s.value,'$.signature') AND t.currency=json_extract(s.value,'$.currency') AND t.date=json_extract(s.value,'$.date')
+   ))
+  )`,[p.data,owner,p.id,JSON.stringify(sources),owner,owner]);
+ };
  const checkRevision=()=>{if(b.revision!==revision)throw new Conflict('记录已更新，请刷新后重试')};
  if(b.action==='ruleignore'||b.action==='ruleunignore'){
   if(saved&&saved.kind!=='confirmation')return reply({error:'记录类型冲突'},409);
@@ -80,16 +108,16 @@ export async function POST(req:Request){try{
   const trips=(await db.prepare("SELECT * FROM trip_entries WHERE owner=? AND paylater<>''").bind(owner).all<TripEntryRow>()).results;
   const plans=allCommitments(stored,trips).filter(p=>p.kind==='paylater'&&p.currency===b.currency&&p.status==='active');
   if(plans.some(p=>p.source_key===sourceKey))return reply({error:'这个平台和月份已有月账单，请编辑原账单'},409);
-  const already=new Set(plans.flatMap(p=>(JSON.parse(p.data) as PlanData).covers||[]).map(c=>c.row));
-  const covers=plans.filter(p=>!p.source_key.startsWith('invoice:')).flatMap(p=>{const d=JSON.parse(p.data) as PlanData;if(d.provider!==b.provider)return [];return d.rows.filter(r=>!r.paid_date&&r.due.startsWith(month)).map(r=>{if(p.review||already.has(r.id))throw Error('有关联计划需先核对，或已经归入其他月账单');return {plan:p.id,row:r.id,amount:r.amount};})});
+  const covers=plans.filter(p=>!p.source_key.startsWith('invoice:')).flatMap(p=>{const d=JSON.parse(p.data) as PlanData;if(d.provider!==b.provider)return [];return d.rows.filter(r=>!r.paid_date&&r.due.startsWith(month)).map(r=>{if(p.review)throw new Conflict('有关联计划需先核对');return {plan:p.id,row:r.id,amount:r.amount};})});
   if(total<covers.reduce((n,c)=>n+c.amount,0))return reply({error:'月账单小于已关联分期合计，请先核对各笔金额'},400);
   const title=typeof b.title==='string'&&b.title.trim()?b.title.trim():paymentMethods[b.provider]+' 月账单';if(title.length>100)return reply({error:'名称过长'},400);
   const data:PlanData={provider:b.provider,total,date:today(),months:1,first_due:b.due,rows:planRows(b.id,total,1,b.due),covers};
-  await write({id:b.id,kind:'paylater',title,currency:b.currency,source_key:sourceKey,source_signature:'',data:JSON.stringify(data),revision,status:'active'}).run();
+  const result=await writeInvoice({id:b.id,kind:'paylater',title,currency:b.currency,source_key:sourceKey,source_signature:'',data:JSON.stringify(data),revision,status:'active'},plans).run();
+  return result.meta.changes?reply({ok:true}):reply({error:'月账单或关联计划已变化，请刷新后核对'},409);
  }else if(b.action==='purchase'){
   if(saved&&saved.kind!=='paylater'||!b.id.match(/^[\w-]{8,100}$/)||b.id.startsWith('trip:'))return reply({error:'记录类型不适用'},400);
   const oldTx=await db.prepare('SELECT * FROM transactions WHERE owner=? AND id=?').bind(owner,b.id).first<TransactionRow>();
-  if(oldTx?.rule_id)return reply({error:'周期账单的 PayLater 应付请在平台月账单中登记，不要再记一次消费'},409);
+  if(saved?.source_key.startsWith('invoice:')||oldTx?.rule_id||oldTx?.note==='周期付款确认')return reply({error:'周期或平台月账单请在账单中核对'},409);
   if(oldTx&&!b.edit&&!saved)return reply({error:'交易已存在，请编辑原记录'},409);
   if(b.edit&&!oldTx||oldTx?.deleted)return reply({error:'交易不存在'},404);
   const title=typeof b.title==='string'&&b.title.trim()?b.title.trim():b.category;
@@ -108,9 +136,10 @@ export async function POST(req:Request){try{
   // This also protects ordinary -> PayLater conversion from a concurrent edit/delete.
   const txGuard='SELECT 1 FROM transactions WHERE owner=? AND id=? AND deleted=0 AND title=? AND amount=? AND currency=? AND kind=? AND category=? AND date=? AND note=?';
   const txValues=oldTx?[owner,b.id,oldTx.title,oldTx.amount,oldTx.currency,oldTx.kind,oldTx.category,oldTx.date,oldTx.note||'']:[];
-  const writePlan=b.edit?(saved?db.prepare('UPDATE pocket_commitments SET title=?,currency=?,source_key=?,source_signature=?,data=?,status=?,revision=revision+1,mutation=? WHERE owner=? AND id=? AND revision=? AND EXISTS ('+txGuard+')').bind(p.title,p.currency,p.source_key,p.source_signature,p.data,p.status,mutation,owner,b.id,revision,...txValues):db.prepare('INSERT OR IGNORE INTO pocket_commitments(owner,id,kind,title,currency,source_key,source_signature,data,revision,status,mutation) SELECT ?,?,?,?,?,?,?,?,0,?,? WHERE EXISTS ('+txGuard+')').bind(owner,b.id,p.kind,p.title,p.currency,p.source_key,p.source_signature,p.data,p.status,mutation,...txValues)):db.prepare('INSERT OR IGNORE INTO pocket_commitments(owner,id,kind,title,currency,source_key,source_signature,data,revision,status,mutation) SELECT ?,?,?,?,?,?,?,?,0,?,? WHERE NOT EXISTS (SELECT 1 FROM transactions WHERE owner=? AND id=?)').bind(owner,b.id,p.kind,p.title,p.currency,p.source_key,p.source_signature,p.data,p.status,mutation,owner,b.id);
-  const updateTx=b.edit?db.prepare("UPDATE transactions SET title=?,amount=?,currency=?,kind='expense',category=?,date=?,note=? WHERE id=? AND owner=? AND EXISTS (SELECT 1 FROM pocket_commitments WHERE owner=? AND id=? AND mutation=?)").bind(title,total,b.currency,b.category,b.date,note,b.id,owner,owner,b.id,mutation):guarded('INSERT OR IGNORE INTO transactions(id,owner,title,amount,currency,kind,category,date,note,deleted,created_at) SELECT ?,?,?,?,?,?,?,?,?,0,?',[b.id,owner,title,total,b.currency,'expense',b.category,b.date,note,new Date().toISOString()]);
-  await db.batch([writePlan,updateTx]);
+  const txCondition=b.edit?'EXISTS ('+txGuard+')':'NOT EXISTS (SELECT 1 FROM transactions WHERE owner=? AND id=?)';
+  const planWrite=write(p,notCovered+' AND '+txCondition,[owner,b.id,...(b.edit?txValues:[owner,b.id])]);
+  const updateTx=b.edit?db.prepare("UPDATE transactions SET title=?,amount=?,currency=?,kind='expense',category=?,date=?,note=? WHERE id=? AND owner=? AND EXISTS (SELECT 1 FROM pocket_commitments WHERE owner=? AND id=? AND mutation=?)").bind(title,total,b.currency,b.category,b.date,note,b.id,owner,owner,b.id,mutation):guarded('INSERT INTO transactions(id,owner,title,amount,currency,kind,category,date,note,deleted,created_at) SELECT ?,?,?,?,?,?,?,?,?,0,?',[b.id,owner,title,total,b.currency,'expense',b.category,b.date,note,new Date().toISOString()]);
+  await db.batch([planWrite,updateTx,requireLinkedWrite()]);
  }else if(b.action==='deposit'||b.action==='deposit_edit'){
   if(!/^[\w-]{8,100}$/.test(b.id))return reply({error:'押金标识无效'},400);
   if(saved&&b.action==='deposit_edit'){
@@ -130,27 +159,36 @@ export async function POST(req:Request){try{
   if(current.kind==='paylater'){
    if(b.id.startsWith('trip:')&&(!imported||imported.source_signature!==current.source_signature||imported.currency!==current.currency||JSON.parse(imported.data).date!==JSON.parse(current.data).date)&&!['plan','cancel','unpay'].includes(b.action))return reply({error:'Trip Share 原记录已变化，请先核对还款计划'},409);
    const data=JSON.parse(current.data) as PlanData;
-   const other=(await db.prepare("SELECT * FROM pocket_commitments WHERE owner=? AND kind='paylater' AND status='active'").bind(owner).all<Commitment>()).results;
-   if(other.some(p=>p.id!==current.id&&(JSON.parse(p.data) as PlanData).covers?.some(c=>c.plan===current.id))&&!['cancel','unpay'].includes(b.action))return reply({error:'此计划已归入平台月账单，请在月账单确认付款；修改前须先取消该月账单'},409);
-   if(current.source_key.startsWith('invoice:')&&!['cancel','unpay'].includes(b.action)){
+   const invoice=current.source_key.startsWith('invoice:');
+   if(b.action==='pay'&&current.status!=='active')return reply({error:'已取消的计划不能确认付款'},409);
+   let sources:Commitment[]|undefined;
+   if(invoice&&['restore','plan','pay'].includes(b.action)){
+    const other=(await db.prepare("SELECT * FROM pocket_commitments WHERE owner=? AND kind='paylater' AND status='active' AND id<>?").bind(owner,b.id).all<Commitment>()).results;
     const entries=(await db.prepare("SELECT * FROM trip_entries WHERE owner=? AND paylater<>''").bind(owner).all<TripEntryRow>()).results;
-    if(allCommitments(other,entries).find(p=>p.id===current.id)?.review)return reply({error:'月账单关联的消费已变化，请先核对或取消月账单'},409);
+    sources=allCommitments([...other,current],entries);
+    if(sources.find(p=>p.id===current.id)?.review)return reply({error:'月账单关联的消费已变化，请先核对或取消月账单'},409);
    }
-   if(b.action==='cancel'||b.action==='restore'){if(b.action==='cancel'&&data.rows.some(r=>r.paid_date))return reply({error:'请先撤销已付款确认，再取消计划'},409);await write({...current,status:b.action==='cancel'?'cancelled':'active'}).run();
+   const savePlan=(p:Commitment)=>sources&&p.status==='active'?writeInvoice(p,sources):writePlan(p);
+   if(b.action==='cancel'||b.action==='restore'){
+    if(b.action==='cancel'&&data.rows.some(r=>r.paid_date))return reply({error:'请先撤销已付款确认，再取消计划'},409);
+    if(invoice&&b.action==='restore'&&!invoiceRowsMatchMonth(data.rows,current.source_key))return reply({error:'平台月账单须保留原月份内的一期，请先核对计划'},409);
+    await savePlan({...current,status:b.action==='cancel'?'cancelled':'active'}).run();
    }else if(b.action==='plan'){
     if(imported&&imported.currency!==current.currency)return reply({error:'源币种已改变，请先取消原计划并核对新的平台账单'},409);
     if(b.id.startsWith('trip:')&&!imported)return reply({error:'源消费已删除或付款方式已改变。原还款记录保留，请先核对平台账单'},409);
     const total=imported?(JSON.parse(imported.data) as PlanData).total:data.total;
     validateRows(b.rows,total);
+    if(invoice&&!invoiceRowsMatchMonth(b.rows,current.source_key))return reply({error:'平台月账单须保留原月份内的一期'},409);
     for(const row of b.rows)if(row.paid_date&&row.paid_date>today())return reply({error:'实际付款日期不能是未来'},400);
     for(const paid of data.rows.filter(r=>r.paid_date)){const wanted=b.rows.find((r:Instalment)=>r.id===paid.id);if(!wanted||JSON.stringify(wanted)!==JSON.stringify(paid))return reply({error:'已付款的期数不可改写；请先撤销付款确认'},409);}
     if(b.rows.some((r:Instalment)=>r.paid_date&&!data.rows.some(old=>old.id===r.id&&old.paid_date===r.paid_date)))return reply({error:'请通过已付款按钮确认付款'},400);
     data.rows=b.rows;data.total=total;if(imported){const fresh=JSON.parse(imported.data) as PlanData;data.date=fresh.date;data.provider=fresh.provider;}data.months=b.rows.length;data.first_due=b.rows[0].due;
-    await write({...current,title:imported?.title||current.title,source_signature:imported?.source_signature||current.source_signature,data:JSON.stringify(data)}).run();
+    await savePlan({...current,title:imported?.title||current.title,source_signature:imported?.source_signature||current.source_signature,data:JSON.stringify(data)}).run();
    }else if(b.action==='pay'||b.action==='unpay'){
     const row=data.rows.find(r=>r.id===b.row_id);if(!row)return reply({error:'还款期数不存在'},404);
-    if(b.action==='pay'&&(!validDate(b.date)||b.date>today()||!current.source_key.startsWith('invoice:')&&b.date<data.date))return reply({error:'请填写已发生的付款日期'},400);
-    row.paid_date=b.action==='pay'?b.date:'';await write({...current,data:JSON.stringify(data)}).run();
+    if(b.action==='pay'&&invoice&&!invoiceRowsMatchMonth(data.rows,current.source_key))return reply({error:'平台月账单须保留原月份内的一期，请先核对计划'},409);
+    if(b.action==='pay'&&(!validDate(b.date)||b.date>today()||!invoice&&b.date<data.date))return reply({error:'请填写已发生的付款日期'},400);
+    row.paid_date=b.action==='pay'?b.date:'';await savePlan({...current,data:JSON.stringify(data)}).run();
    }else return reply({error:'操作无效'},400);
   }else if(b.action==='movement_void'){
    if(current.kind!=='deposit')return reply({error:'记录类型无效'},400);
@@ -168,7 +206,7 @@ export async function POST(req:Request){try{
    const amount=minor(String(b.amount),current.currency);if(amount>depositHeld(data))return reply({error:'不能超过尚未退回的押金'},409);
    const note=String(b.note||'');if(note.length>500)return reply({error:'备注最多 500 字'},400);
    data.movements.push({id:b.movement_id,kind:b.kind,amount,date:b.date,note});const statements=[write({...current,data:JSON.stringify(data)})];
-   if(b.kind!=='refund')statements.push(guarded('INSERT OR IGNORE INTO transactions(id,owner,title,amount,currency,kind,category,date,note,deleted,created_at) SELECT ?,?,?,?,?,?,?,?,?,0,?',[`deposit:${b.id}:${b.movement_id}`,owner,current.title+(b.kind==='rent'?' · 抵租':' · 扣款'),amount,current.currency,'expense',b.kind==='rent'?'居住':'其他',b.date,note,new Date().toISOString()]));
+   if(b.kind!=='refund')statements.push(guarded('INSERT INTO transactions(id,owner,title,amount,currency,kind,category,date,note,deleted,created_at) SELECT ?,?,?,?,?,?,?,?,?,0,?',[`deposit:${b.id}:${b.movement_id}`,owner,current.title+(b.kind==='rent'?' · 抵租':' · 扣款'),amount,current.currency,'expense',b.kind==='rent'?'居住':'其他',b.date,note,new Date().toISOString()]),requireLinkedWrite());
    await db.batch(statements);
   }else return reply({error:'操作无效'},400);
  }
@@ -178,5 +216,7 @@ export async function POST(req:Request){try{
   if(error instanceof SyntaxError)return reply({error:'请求格式无效'},400);
   const message=error instanceof Error?error.message:'';console.error('commitment.write',error instanceof Error?error.name:'unknown');
   if(error instanceof Conflict)return reply({error:message},409);
+  if(message.includes('pocket_commitments.owner, pocket_commitments.source_key, pocket_commitments.currency'))return reply({error:'这个平台和月份已有月账单，请刷新后核对'},409);
+  if(message.includes('UNIQUE constraint failed: transactions.id'))return reply({error:'该交易标识已被占用，请刷新后重试'},409);
   return /[\u3400-\u9fff]/.test(message)&&!/(SQL|SELECT|INSERT|UPDATE|DELETE|D1_)/.test(message)?reply({error:message},400):reply({error:'保存暂时失败，请保留输入并重试'},503);
  }}
