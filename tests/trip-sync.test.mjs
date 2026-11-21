@@ -6,16 +6,19 @@ import {readFileSync,readdirSync} from 'node:fs';
 const sql=new DatabaseSync(':memory:');
 for(const f of readdirSync('drizzle').filter(f=>f.endsWith('.sql')).sort())sql.exec(readFileSync('drizzle/'+f,'utf8'));
 const wrap=(q,p=[])=>({bind:(...args)=>wrap(q,args),first:async()=>sql.prepare(q).get(...p)||null,all:async()=>({results:sql.prepare(q).all(...p)}),run:async()=>{const r=sql.prepare(q).run(...p);return {meta:{changes:r.changes}}}});
-const DB={prepare:q=>wrap(q),batch:async stmts=>{sql.exec('BEGIN');try{for(const s of stmts)await s.run();sql.exec('COMMIT')}catch(e){sql.exec('ROLLBACK');throw e}}};
+const DB={prepare:q=>wrap(q),batch:async stmts=>{sql.exec('BEGIN');try{const results=[];for(const s of stmts)results.push(await s.run());sql.exec('COMMIT');return results}catch(e){sql.exec('ROLLBACK');throw e}}};
 const transpile=s=>ts.transpileModule(s,{compilerOptions:{module:ts.ModuleKind.ESNext,target:ts.ScriptTarget.ES2022}}).outputText;
 const domain=await import('data:text/javascript;base64,'+Buffer.from(transpile(readFileSync('lib/ledger-domain.ts','utf8'))).toString('base64'));
+const financeSource=transpile(readFileSync('lib/commitments.ts','utf8')).replace(/^import .*;\n/gm,'').replace(/export /g,'');
+const tripPlanRows=new Function('validDate',financeSource+';return typeof tripPlanRows==="function"?tripPlanRows:undefined;')(domain.validDate);
 const source=readFileSync('app/api/trip-sync/route.ts','utf8').replace(/^import .*;\n/gm,'');
 const originalFetch=globalThis.fetch;
-let pages=[];globalThis.fetch=async(url,options)=>{assert.equal(options.headers.Authorization,'Bearer private-test-token');const page=pages.shift();if(!page)throw Error('Unexpected page');return Response.json(page.body,{status:page.status||200})};
+let pages=[];globalThis.fetch=async(url,options)=>{assert.equal(options.headers.Authorization,'Bearer private-test-token');const page=pages.shift();if(!page)throw Error('Unexpected page');return typeof page==='function'?page(url,options):Response.json(page.body,{status:page.status||200})};
 let user={userId:'ledger-a',email:'yeehang32@gmail.com'};
 const env={DB,LEDGER_OWNER_EMAIL:'yeehang32@gmail.com',POCKET_SYNC_TOKEN:'private-test-token',POCKET_SYNC_EMAIL:'a@example.test'};
-const factory=new Function('env','getChatGPTUser','validDate',transpile(source).replace(/export /g,'')+';return {GET,POST};');
-const api=factory(env,async()=>user,domain.validDate);
+const factory=new Function('env','getChatGPTUser','validDate','tripPlanRows','setTimeout',transpile(source).replace(/export /g,'')+';return {GET,POST};');
+let responseTimeout;
+const api=factory(env,async()=>user,domain.validDate,tripPlanRows,(callback,timeout)=>setTimeout(callback,responseTimeout??timeout));
 const sync=()=>api.POST(new Request('https://ledger.test/api/trip-sync',{method:'POST',headers:{origin:'https://ledger.test'}}));
 const expense=(consumed,deleted=false)=>({record_type:'expense',group_id:'daily-1',group_type:'daily',expense_id:'expense-1',member_id:'member-a',date:'2026-09-24',title:'Lunch',category:'Food',currency:'MYR',consumed_minor:consumed,paid_minor:12000,deleted});
 const payment={record_type:'payment',group_id:'daily-1',payment_id:'payment-1',member_id:'member-a',date:'2026-09-25',currency:'MYR',amount_minor:2000,from_member_id:'member-b',to_member_id:'member-a',deleted:false};
@@ -73,5 +76,93 @@ await test('TripShare fallback tombstones (unresolvable payment/expense) remove 
  for(const cursor of ['tomb-1','tomb-2']){pages=[{body:{schema_version:1,mode:'incremental',entries:[payTomb,expTomb],next_cursor:cursor,has_more:false}}];assert.equal((await sync()).status,200);}
  assert.equal(count(),2);assert.equal(sql.prepare("SELECT COUNT(*) AS n FROM trip_entries WHERE record_id IN ('ghost-payment','ghost-expense') AND deleted=1").get().n,2);
  assert.equal(sql.prepare('SELECT cursor FROM trip_sync').get().cursor,'tomb-2');
+});
+const responsePage=(entries,next_cursor,has_more=false,mode='incremental')=>({schema_version:1,mode,entries,next_cursor,has_more});
+const useOwner=id=>{user={...user,userId:id};};
+const checkpoint=()=>sql.prepare('SELECT * FROM trip_sync WHERE owner=?').get(user.userId);
+const published=()=>sql.prepare('SELECT record_id FROM trip_entries WHERE owner=? ORDER BY record_id').all(user.userId).map(r=>r.record_id);
+
+await test('Expired TripShare run cannot write rows, checkpoint, or release its replacement lease',async()=>{
+ useOwner('lease-test');
+ pages=[{body:responsePage([], 'initial')}];assert.equal((await sync()).status,200);
+ const oldBody=Promise.withResolvers(),freshBody=Promise.withResolvers();
+ const oldReading=Promise.withResolvers(),freshReading=Promise.withResolvers();
+ pages=[
+  ()=>({ok:true,status:200,json:()=>{oldReading.resolve();return oldBody.promise;}}),
+  ()=>({ok:true,status:200,json:()=>{freshReading.resolve();return freshBody.promise;}}),
+ ];
+ const old=sync();await oldReading.promise;
+ sql.prepare('UPDATE trip_sync SET lock_until=0 WHERE owner=?').run(user.userId);
+ const fresh=sync();await freshReading.promise;
+ const replacement=checkpoint();
+ oldBody.resolve(responsePage([expense(1)],'stale'));
+ const oldResult=await old;
+ const afterOld=checkpoint(),oldRows=published();
+ freshBody.resolve(responsePage([{...expense(2),expense_id:'fresh'}],'fresh'));
+ assert.equal((await fresh).status,200);
+ assert.equal(oldResult.status,503);
+ assert.equal(afterOld.lock_until,replacement.lock_until);
+ assert.equal(afterOld.lease,replacement.lease);
+ assert.equal(afterOld.status,'syncing');assert.equal(afterOld.cursor,'initial');assert.deepEqual(oldRows,[]);
+ assert.deepEqual(published(),['fresh']);
+});
+
+await test('TripShare response timeout covers a body stalled after headers',async()=>{
+ useOwner('timeout-test');
+ responseTimeout=15;
+ let signal,releaseBody;
+ try{
+  pages=[(_url,options)=>{
+   signal=options.signal;
+   const body=new Promise(resolve=>{releaseBody=setTimeout(()=>resolve(responsePage([expense(1)],'too-late')),80);});
+   return {ok:true,status:200,json:()=>body};
+  }];
+  assert.equal((await sync()).status,503);
+  assert.equal(signal.aborted,true);
+  assert.equal(checkpoint().cursor,'');assert.deepEqual(published(),[]);
+ }finally{responseTimeout=undefined;clearTimeout(releaseBody);}
+});
+
+await test('Full resync keeps published rows and full mode across mixed pages and requests',async()=>{
+ useOwner('full-resume-test');
+ pages=[{body:responsePage([expense(1)],'before')}];assert.equal((await sync()).status,200);
+ pages=[{status:409,body:{reset_required:true}}];assert.equal((await sync()).status,409);
+ const first={...expense(2),expense_id:'first-new'};
+ pages=[{body:responsePage([first],'page-1',true,'full')},...[2,3,4,5].map(i=>({body:responsePage([], 'page-'+i,true)}))];
+ assert.equal((await (await sync()).json()).complete,false);
+ assert.deepEqual(published(),['expense-1']);
+ assert.equal(checkpoint().mode,'full');assert.equal(checkpoint().cursor,'page-5');
+ pages=[url=>{assert.equal(url.searchParams.get('cursor'),'page-5');return Response.json(responsePage([payment],null));}];
+ assert.equal((await sync()).status,200);
+ assert.deepEqual(published(),['first-new','payment-1']);assert.equal(checkpoint().status,'synced');assert.equal(checkpoint().cursor,'');
+});
+
+await test('Full resync cleanup failure rolls back publish and terminal checkpoint for retry',async()=>{
+ useOwner('full-cleanup-test');
+ pages=[{body:responsePage([expense(1)],'before')}];assert.equal((await sync()).status,200);
+ sql.prepare("UPDATE trip_sync SET last_completed='prior' WHERE owner=?").run(user.userId);
+ pages=[{status:409,body:{reset_required:true}}];assert.equal((await sync()).status,409);
+ const final=responsePage([payment],'after',false,'full');
+ sql.exec("CREATE TRIGGER fail_cleanup BEFORE DELETE ON trip_entries WHEN OLD.owner='full-cleanup-test' BEGIN SELECT RAISE(ABORT,'cleanup unavailable'); END");
+ try{
+  pages=[{body:final}];assert.equal((await sync()).status,503);
+  assert.equal(checkpoint().cursor,'');assert.equal(checkpoint().last_completed,'prior');assert.equal(checkpoint().status,'error');
+  assert.deepEqual(published(),['expense-1']);
+ }finally{sql.exec('DROP TRIGGER fail_cleanup');}
+ pages=[{body:final}];assert.equal((await sync()).status,200);
+ assert.equal(checkpoint().cursor,'after');assert.notEqual(checkpoint().last_completed,'prior');
+ assert.deepEqual(published(),['payment-1']);
+});
+
+await test('TripShare rejects unschedulable PayLater amounts and dates before writing any page rows',async()=>{
+ useOwner('bad-plan-test');
+ pages=[{body:responsePage([], 'valid')}];assert.equal((await sync()).status,200);
+ for(const [currency,total,first_due] of [['JPY',1,'2026-10-31'],['IDR',1000000001,'2026-10-31'],['MYR',100,'2100-12-31']]){
+  const invalid={...expense(0),currency,paylater:{provider:'spaylater',months:2,first_due,total}};
+  pages=[{body:responsePage([payment,invalid],'invalid')}];
+  const result=await sync();assert.equal(result.status,503);
+  assert.deepEqual((await result.json()).fields,['paylater']);
+  assert.equal(checkpoint().cursor,'valid');assert.deepEqual(published(),[]);
+ }
 });
 globalThis.fetch=originalFetch;sql.close();

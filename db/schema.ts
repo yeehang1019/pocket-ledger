@@ -12,11 +12,13 @@ export const occurrences=sqliteTable('occurrences',{
 export const budgets=sqliteTable('budgets',{
  owner:text('owner').notNull(),month:text('month').notNull(),currency:text('currency').notNull(),category:text('category').notNull(),amount:integer('amount').notNull()
 },t=>[uniqueIndex('budget_scope').on(t.owner,t.month,t.currency,t.category)]);
-export const tripEntries=sqliteTable('trip_entries',{
+const tripEntryColumns=()=>({
  owner:text('owner').notNull(),groupId:text('group_id').notNull(),recordId:text('record_id').notNull(),memberId:text('member_id').notNull(),recordType:text('record_type').notNull(),groupType:text('group_type').notNull().default(''),date:text('date').notNull(),title:text('title').notNull().default(''),category:text('category').notNull().default(''),currency:text('currency').notNull(),consumed:integer('consumed').notNull().default(0),paid:integer('paid').notNull().default(0),amount:integer('amount').notNull().default(0),fromMember:text('from_member').notNull().default(''),toMember:text('to_member').notNull().default(''),deleted:integer('deleted').notNull().default(0),seenRun:text('seen_run').notNull().default(''),paylater:text('paylater').notNull().default('')
-},t=>[uniqueIndex('trip_entry_key').on(t.owner,t.recordType,t.groupId,t.recordId,t.memberId),index('trip_entry_owner_date').on(t.owner,t.date)]);
+});
+export const tripEntries=sqliteTable('trip_entries',tripEntryColumns(),t=>[uniqueIndex('trip_entry_key').on(t.owner,t.recordType,t.groupId,t.recordId,t.memberId),index('trip_entry_owner_date').on(t.owner,t.date)]);
+export const tripEntryStage=sqliteTable('trip_entry_stage',tripEntryColumns(),t=>[uniqueIndex('trip_entry_stage_key').on(t.owner,t.recordType,t.groupId,t.recordId,t.memberId)]);
 export const tripSync=sqliteTable('trip_sync',{
- owner:text('owner').primaryKey(),cursor:text('cursor').notNull().default(''),run:text('run').notNull().default(''),mode:text('mode').notNull().default('full'),status:text('status').notNull().default('idle'),lastCompleted:text('last_completed').notNull().default(''),lockUntil:integer('lock_until').notNull().default(0)
+ owner:text('owner').primaryKey(),cursor:text('cursor').notNull().default(''),run:text('run').notNull().default(''),mode:text('mode').notNull().default('full'),status:text('status').notNull().default('idle'),lastCompleted:text('last_completed').notNull().default(''),lockUntil:integer('lock_until').notNull().default(0),lease:text('lease').notNull().default(''),staging:integer('staging').notNull().default(0)
 });
 export const tripGroupLabels=sqliteTable('trip_group_labels',{
  owner:text('owner').notNull(),groupId:text('group_id').notNull(),label:text('label').notNull()

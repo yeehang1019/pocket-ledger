@@ -8,7 +8,7 @@ export function minor(value:string,currency:string){
  const [a,b='']=value.split('.');const amount=Number(a)*10**decimals+Number(b.padEnd(decimals,'0'));
  if(!Number.isSafeInteger(amount)||amount<=0||amount>100000000000)throw new Error('金额必须大于零且在支持范围内');return amount;
 }
-export const today=()=>new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Kuala_Lumpur',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date());
+export const today=(at=new Date())=>new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Kuala_Lumpur',year:'numeric',month:'2-digit',day:'2-digit'}).format(at);
 export function validDate(s:string){if(!Number.isFinite(new Date(s+'T00:00:00Z').getTime()))return false;return /^\d{4}-\d{2}-\d{2}$/.test(s)&&s>='2000-01-01'&&s<='2100-12-31'&&new Date(s+'T00:00:00Z').toISOString().slice(0,10)===s;}
 export function dates(start:string,frequency:string,until:string,monthDays=''){
  const [y,m,d]=start.split('-').map(Number);const result:string[]=[];

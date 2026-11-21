@@ -127,7 +127,8 @@ test('full payment cards expose an exact due date and uniquely named confirmatio
  assert.ok(html.includes('due-date-tile'));
 });
 test('current-month summary renders platform obligation rather than a second personal expense',()=>{
- const day=today(),row={id:'source-plan',kind:'paylater',title:'替朋友购买',currency:'MYR',source_key:'manual:source-plan',source_signature:'',revision:0,status:'active',data:JSON.stringify({provider:'spaylater',total:30900,date:day,months:3,first_due:day,rows:[{id:'one',due:day,amount:10300,paid_date:''}]})};
+ const day=today(),future=[1,2].map(offset=>new Date(Date.UTC(+day.slice(0,4),+day.slice(5,7)+offset-1,1)).toISOString().slice(0,10));
+ const row={id:'source-plan',kind:'paylater',title:'替朋友购买',currency:'MYR',source_key:'manual:source-plan',source_signature:'',revision:0,status:'active',data:JSON.stringify({provider:'spaylater',total:30900,date:day,months:3,first_due:day,rows:[day,...future].map((due,i)=>({id:String(i+1),due,amount:10300,paid_date:''}))})};
  const html=renderToStaticMarkup(React.createElement(FinanceHub,{compact:true,data:{commitments:[row],bills:[]},trip:[],rules:[],occurrences:[],currency:'MYR',save:async()=>true,savePocket:async()=>true}));
  assert.match(html,/\d+ 月待付/);assert.ok(html.includes('替朋友购买'));assert.ok(html.includes('103.00'));assert.ok(html.includes('确认付款'));assert.ok(!html.includes('309.00'));
 });

@@ -323,4 +323,20 @@ await test('a linked write that affects zero rows aborts the commitment batch',a
   assert.equal(sql.prepare('SELECT 1 FROM transactions WHERE id=?').get(purchase.id),undefined);
  }finally{sql.exec('DROP TRIGGER skip_linked_insert');}
 });
+const samplePlanDue='2026-10-31';
+const validPlan={id:'valid-plan',kind:'paylater',title:'Valid',currency:'MYR',source_key:'',source_signature:'',revision:0,status:'active',data:JSON.stringify({provider:'spaylater',total:100,date:samplePlanDue,months:1,first_due:samplePlanDue,rows:finance.planRows('valid-plan',100,1,samplePlanDue)})};
+const corruptPlan={...validPlan,id:'corrupt-plan',data:'{"rows":null}'};
+await test('Invalid stored PayLater plans are skipped and flagged by allCommitments',()=>{
+ const storedTrip={record_type:'expense',group_id:'group',record_id:'bad-jpy',member_id:'member',deleted:0,title:'Invalid TripShare',currency:'JPY',date:'2026-10-01',paylater:JSON.stringify({provider:'spaylater',months:2,first_due:samplePlanDue,total:1})};
+ const flagged=[];
+ const plans=finance.allCommitments([validPlan,corruptPlan],[storedTrip],id=>flagged.push(id));
+ assert.deepEqual(plans.map(p=>p.id),['valid-plan']);
+ assert.deepEqual(flagged,['trip:group:bad-jpy:member','corrupt-plan']);
+});
+await test('paymentDue skips and flags an invalid stored plan while returning valid dues',()=>{
+ const flagged=[];
+ const items=finance.paymentDue([validPlan,corruptPlan],[],[],[],samplePlanDue,samplePlanDue,domain.dates,id=>flagged.push(id));
+ assert.deepEqual(items.map(d=>d.id),['valid-plan:1']);
+ assert.deepEqual(flagged,['corrupt-plan']);
+});
 sql.close();delete globalThis.__commitmentDomain;

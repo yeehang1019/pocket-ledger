@@ -88,4 +88,24 @@ await test('a card deleted before INSERT cannot leave an orphaned bill',async()=
  assert.equal((await post(linked)).status,400);
  assert.equal((await get()).bills.length,0);
 });
+await test('Pocket caps history with a warning and returns unresolved bills and payment state',async()=>{
+ user='pocket-cap-owner';
+ sql.prepare(`WITH RECURSIVE seq(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM seq WHERE n<2001)
+  INSERT INTO pocket_bills(owner,id,title,mode,category,amount,currency,consumption_date,paid_date,created_at)
+  SELECT ?, 'paid-'||n,'Paid','postpaid','账单',100,'MYR','2026-10-01','2026-10-02','2026-10-02' FROM seq`).run(user);
+ sql.prepare(`WITH RECURSIVE seq(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM seq WHERE n<2001)
+  INSERT INTO pocket_bills(owner,id,title,mode,category,amount,currency,consumption_date,created_at)
+  SELECT ?, 'open-'||n,'Open','postpaid','账单',100,'MYR','2000-01-01','2000-01-01' FROM seq`).run(user);
+ sql.prepare(`WITH RECURSIVE seq(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM seq WHERE n<2001)
+  INSERT INTO pocket_categories(owner,name) SELECT ?, 'category-'||n FROM seq`).run(user);
+ const insert=sql.prepare("INSERT INTO pocket_commitments(owner,id,kind,title,currency,data) VALUES (?,?,?,'Plan','MYR',?)");
+ insert.run(user,'old-mark','confirmation',JSON.stringify({paid_date:'2000-01-02',amount:100}));
+ insert.run(user,'open-plan','paylater',JSON.stringify({date:'2000-01-01',rows:[{paid_date:''}]}));
+ const response=await api.GET(),data=await response.json();
+ assert.equal(response.status,200);assert.equal(data.truncated,true);
+ assert.equal(data.categories.length,2000);
+ assert.equal(data.bills.filter(b=>!b.paid_date).length,2001);
+ assert.equal(data.bills.filter(b=>b.paid_date).length,2000);
+ assert.deepEqual(data.commitments.map(c=>c.id),['open-plan','old-mark']);
+});
 sql.close();

@@ -1,6 +1,6 @@
 import {env} from 'cloudflare:workers';
 import {getChatGPTUser} from '@/app/chatgpt-auth';
-import {sourceSnapshot,projectPayables,syncPayables,type StoredSpace} from '@/lib/trip-payables';
+import {sourceSnapshot,projectPayables,selectedPayableSpaces,syncPayables,type StoredSpace} from '@/lib/trip-payables';
 export const dynamic='force-dynamic';
 const reply=(body:unknown,status=200)=>Response.json(body,{status,headers:{'Cache-Control':'private, no-store'}});
 async function user(){const u=await getChatGPTUser();const allowed=env.LEDGER_OWNER_EMAIL;return u&&allowed&&u.email.toLowerCase()===allowed.trim().toLowerCase()?u:null}
@@ -17,13 +17,16 @@ export async function POST(request:Request){
  try{
   const raw=await request.text();if(raw.length>20000)return reply({error:'Request too large'},413);const body=JSON.parse(raw),db=env.DB!;
   await db.prepare('INSERT OR IGNORE INTO trip_sync_settings(owner) VALUES(?)').bind(u.userId).run();
-  if(body.action==='pause'){const paused=await db.prepare("UPDATE trip_sync_settings SET activated=0,status='paused' WHERE owner=? AND lock_until<?").bind(u.userId,Date.now()).run();if(!paused.meta.changes)throw Error('Sync is running. Retry pause shortly.');return reply({ok:true});}
+  if(body.action==='pause'){
+   await db.prepare("UPDATE trip_sync_settings SET activated=0,status='paused',lease='',lock_until=0 WHERE owner=?").bind(u.userId).run();
+   return reply({ok:true});
+  }
   if(body.action==='preview'){
    const snapshot=await sourceSnapshot(env);
    const saved=(await db.prepare('SELECT space_id,enabled FROM trip_sync_spaces WHERE owner=?').bind(u.userId).all<StoredSpace>()).results;
-   const preferences=await db.prepare('SELECT also_receive FROM trip_sync_settings WHERE owner=?').bind(u.userId).first<{also_receive:number}>();
+   const preferences=await db.prepare('SELECT also_receive,last_completed FROM trip_sync_settings WHERE owner=?').bind(u.userId).first<{also_receive:number;last_completed:string}>();
    const receive=body.receive===undefined?!!preferences?.also_receive:body.receive===true;
-   const enabled=body.enabled===undefined?snapshot.spaces.filter(s=>!saved.some(p=>p.space_id===s.id)||saved.some(p=>p.space_id===s.id&&p.enabled)).map(s=>s.id):body.enabled;
+   const enabled=body.enabled===undefined?selectedPayableSpaces(snapshot,saved,!!preferences?.last_completed):body.enabled;
    if(!Array.isArray(enabled)||enabled.length>500||enabled.some(x=>typeof x!=='string')||new Set(enabled).size!==enabled.length)throw Error('Choose valid spaces.');
    const incomplete=snapshot.spaces.filter(s=>enabled.includes(s.id)&&s.identity!=='confirmed');
    const known=new Set(snapshot.spaces.map(s=>s.id));if(enabled.some(x=>!known.has(x)))throw Error('Unknown space.');
